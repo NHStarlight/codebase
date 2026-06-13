@@ -795,6 +795,12 @@ class AntiNukeService {
     const guildId = guild.id;
     const now = Date.now();
 
+    // Skip raid detection for whitelisted alt accounts
+    if (this.isWhitelisted(guildId, member?.id)) {
+      logger.debug(`[AntiNuke] Skipping raid detection for whitelisted user ${member?.id} in guild ${guildId}`);
+      return;
+    }
+
     // Get or initialize raid state
     if (!this.antiRaidCache.has(guildId)) {
       this.antiRaidCache.set(guildId, {

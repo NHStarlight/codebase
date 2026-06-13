@@ -1,0 +1,29 @@
+{
+  "_comment": "Rename this file to test_config.json and fill in your actual tokens. DO NOT commit test_config.json to git.",
+  "mainToken": "YOUR_MAIN_BOT_TOKEN_HERE",
+  "altTokens": [
+    "YOUR_ALT_ACCOUNT_1_TOKEN_HERE",
+    "YOUR_ALT_ACCOUNT_2_TOKEN_HERE",
+    "YOUR_ALT_ACCOUNT_3_TOKEN_HERE"
+  ],
+  "testGuildId": "YOUR_TEST_GUILD_ID_HERE",
+  "inviteCodes": [
+    "INVITE_CODE_1_HERE",
+    "INVITE_CODE_2_HERE"
+  ],
+  "safety": {
+    "rejoinDelayMin": 5000,
+    "rejoinDelayMax": 10000,
+    "maxRejoinRetries": 3,
+    "altUserIds": [
+      "ALT_ACCOUNT_1_USER_ID",
+      "ALT_ACCOUNT_2_USER_ID",
+      "ALT_ACCOUNT_3_USER_ID"
+    ],
+    "whitelistAltsInAntiNuke": true
+  },
+  "rateLimit": {
+    "massActionDelayMs": 500,
+    "batchSize": 5
+  }
+}
