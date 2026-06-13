@@ -114,6 +114,12 @@ class TestRunner {
       .map((c) => c.trim())
       .filter(Boolean);
 
+    const altUserIdsRaw = process.env.BOT_ALT_USER_IDS || '';
+    const altUserIds = altUserIdsRaw
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean);
+
     // ── Validation ──
     const errors = [];
     const warnings = [];
@@ -151,6 +157,17 @@ class TestRunner {
       warnings.push('TEST_INVITE_CODES is empty. Auto-rejoin will not work without invite codes.');
     }
 
+    // Alt user IDs
+    if (altUserIds.length === 0) {
+      warnings.push('BOT_ALT_USER_IDS is empty. Alt accounts will not be whitelisted in AntiNukeService.');
+    } else {
+      for (let i = 0; i < altUserIds.length; i++) {
+        if (!isSnowflake(altUserIds[i])) {
+          warnings.push(`BOT_ALT_USER_IDS[${i}] looks invalid (expected 17-20 digit snowflake, got "${altUserIds[i]}")`);
+        }
+      }
+    }
+
     // ── Log results ──
     for (const w of warnings) {
       logger.warn(`[TestRunner] ${w}`);
@@ -177,7 +194,7 @@ class TestRunner {
         rejoinDelayMin: 5000,
         rejoinDelayMax: 10000,
         maxRejoinRetries: 3,
-        altUserIds: [],
+        altUserIds,
         whitelistAltsInAntiNuke: true,
       },
       rateLimit: {
