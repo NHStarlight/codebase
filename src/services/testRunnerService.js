@@ -12,15 +12,13 @@
  *
  * USAGE:
  *   import TestRunnerService from '../services/testRunnerService.js';
- *   const runner = await TestRunnerService.fromConfigFile('tests/test_config.json');
+ *   const runner = TestRunnerService.fromEnv();
  *   await runner.connectAll();
  *   await runner.simulateMassBan(guildId, targetIds);
  *   await runner.disconnectAll();
  */
 
 import { Client, GatewayIntentBits, PermissionFlagsBits } from 'discord.js';
-import { readFileSync, existsSync } from 'fs';
-import { resolve } from 'path';
 import { logger } from '../utils/logger.js';
 
 // ---------------------------------------------------------------------------
@@ -59,11 +57,75 @@ class TestRunner {
   // ===========================================================================
 
   /**
+   * Create a TestRunner from environment variables (.env).
+   *
+   * Required env vars:
+   *   BOT_MAIN_TOKEN  — Token of the main bot account
+   *   BOT_ALT_TOKENS  — Comma-separated tokens of alt accounts (e.g. token1,token2,token3)
+   *
+   * Optional env vars:
+   *   TEST_GUILD_ID   — Target guild ID for tests
+   *   TEST_INVITE_CODES — Comma-separated invite codes for auto-rejoin
+   *
+   * @returns {TestRunner}
+   */
+  static fromEnv() {
+    const mainToken = process.env.BOT_MAIN_TOKEN || process.env.DISCORD_TOKEN || process.env.TOKEN;
+    const altTokensRaw = process.env.BOT_ALT_TOKENS || '';
+    const altTokens = altTokensRaw
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    const testGuildId = process.env.TEST_GUILD_ID || process.env.GUILD_ID || '';
+    const inviteCodesRaw = process.env.TEST_INVITE_CODES || '';
+    const inviteCodes = inviteCodesRaw
+      .split(',')
+      .map((c) => c.trim())
+      .filter(Boolean);
+
+    // Validation
+    if (!mainToken) {
+      logger.warn('[TestRunner] BOT_MAIN_TOKEN (or DISCORD_TOKEN/TOKEN) is missing or empty. Main client will not connect.');
+    }
+    if (altTokens.length === 0) {
+      logger.warn('[TestRunner] BOT_ALT_TOKENS is missing or empty. No alt accounts will be available.');
+    }
+    if (!testGuildId) {
+      logger.warn('[TestRunner] TEST_GUILD_ID (or GUILD_ID) is missing. Some features may not work.');
+    }
+
+    const config = {
+      mainToken: mainToken || '',
+      altTokens,
+      testGuildId,
+      inviteCodes,
+      safety: {
+        rejoinDelayMin: 5000,
+        rejoinDelayMax: 10000,
+        maxRejoinRetries: 3,
+        altUserIds: [],
+        whitelistAltsInAntiNuke: true,
+      },
+      rateLimit: {
+        massActionDelayMs: 500,
+        batchSize: 5,
+      },
+    };
+
+    logger.info(`[TestRunner] Config loaded from env: mainToken=${mainToken ? '***' : 'MISSING'}, altTokens=${altTokens.length}, guildId=${testGuildId || 'MISSING'}`);
+
+    return new TestRunner(config);
+  }
+
+  /**
    * Load config from a JSON file path and return a ready TestRunner.
    * @param {string} configPath - Path to test_config.json
    * @returns {TestRunner}
    */
   static fromConfigFile(configPath) {
+    const { readFileSync, existsSync } = require('fs');
+    const { resolve } = require('path');
     const absPath = resolve(configPath);
     if (!existsSync(absPath)) {
       throw new Error(`Config file not found: ${absPath}`);
