@@ -1,3 +1,3777 @@
+##### FILE: src\services\giveawayService.js
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from 'discord.js';
+import { logger } from '../utils/logger.js';
+import { StarlightError, ErrorTypes } from '../utils/errorHandler.js';
+import { getColor } from '../config/bot.js';
+import { getEndedGiveaways, markGiveawayEnded } from '../utils/database.js';
+import { logEvent, EVENT_TYPES } from './loggingService.js';
+import { registerMemoryMap } from '../utils/cacheManager.js';
+import MemoryManager from '../utils/memoryManager.js';
+
+
+const userGiveawayInteractions = new Map();
+const GIVEAWAY_INTERACTION_COOLDOWN = 1000; 
+const GIVEAWAY_INTERACTION_TTL = 5 * 60 * 1000; 
+const GIVEAWAY_INTERACTION_MAX_ENTRIES = 5000;
+const GIVEAWAY_INTERACTION_CLEANUP_INTERVAL = 60 * 1000;
+
+// Register with global memory manager for cleanup
+registerMemoryMap('Giveaway.interactions', userGiveawayInteractions, GIVEAWAY_INTERACTION_TTL);
+MemoryManager.getInstance().trackMap('Giveaway.interactions', userGiveawayInteractions, { maxSize: GIVEAWAY_INTERACTION_MAX_ENTRIES, ttlMs: GIVEAWAY_INTERACTION_TTL });
+let lastInteractionCleanupAt = 0;
+
+function cleanupInteractionCache(force = false) {
+    const now = Date.now();
+    if (!force && (now - lastInteractionCleanupAt) < GIVEAWAY_INTERACTION_CLEANUP_INTERVAL) {
+        return;
+    }
+
+    lastInteractionCleanupAt = now;
+    const cutoff = now - GIVEAWAY_INTERACTION_TTL;
+    for (const [key, timestamp] of userGiveawayInteractions.entries()) {
+        if (timestamp < cutoff) {
+            userGiveawayInteractions.delete(key);
+        }
+    }
+
+    while (userGiveawayInteractions.size > GIVEAWAY_INTERACTION_MAX_ENTRIES) {
+        const oldestKey = userGiveawayInteractions.keys().next().value;
+        if (!oldestKey) break;
+        userGiveawayInteractions.delete(oldestKey);
+    }
+}
+
+
+
+
+
+
+
+export function parseDuration(durationString) {
+    if (!durationString || typeof durationString !== 'string') {
+        throw new StarlightError(
+            'Invalid duration format provided',
+            ErrorTypes.VALIDATION,
+            'Please provide a valid duration (e.g., 1h, 30m, 5d, 10s).',
+            { durationString }
+        );
+    }
+
+    const regex = /^(\d+)([hmds])$/i;
+    const match = durationString.trim().match(regex);
+
+    if (!match) {
+        throw new StarlightError(
+            `Invalid duration format: ${durationString}`,
+            ErrorTypes.VALIDATION,
+            'Invalid duration format. Use: 1h, 30m, 5d, 10s (min: 10s, max: 30d)',
+            { input: durationString }
+        );
+    }
+
+    const amount = parseInt(match[1], 10);
+    const unit = match[2].toLowerCase();
+
+    if (amount <= 0 || amount > 999) {
+        throw new StarlightError(
+            `Duration amount out of range: ${amount}`,
+            ErrorTypes.VALIDATION,
+            'Duration amount must be between 1 and 999.',
+            { amount, unit }
+        );
+    }
+
+    let ms = 0;
+    switch (unit) {
+        case 's':
+            ms = amount * 1000;
+            break;
+        case 'm':
+            ms = amount * 60 * 1000;
+            break;
+        case 'h':
+            ms = amount * 60 * 60 * 1000;
+            break;
+        case 'd':
+            ms = amount * 24 * 60 * 60 * 1000;
+            break;
+        default:
+            throw new StarlightError(
+                `Unknown duration unit: ${unit}`,
+                ErrorTypes.VALIDATION,
+                'Please use s (seconds), m (minutes), h (hours), or d (days).',
+                { unit }
+            );
+    }
+
+    const maxDuration = 30 * 24 * 60 * 60 * 1000; 
+    if (ms > maxDuration) {
+        throw new StarlightError(
+            `Duration exceeds maximum: ${ms}ms > ${maxDuration}ms`,
+            ErrorTypes.VALIDATION,
+            'Maximum duration is 30 days.',
+            { requestedMs: ms, maxMs: maxDuration }
+        );
+    }
+
+    const minDuration = 10 * 1000; 
+    if (ms < minDuration) {
+        throw new StarlightError(
+            `Duration below minimum: ${ms}ms < ${minDuration}ms`,
+            ErrorTypes.VALIDATION,
+            'Minimum duration is 10 seconds.',
+            { requestedMs: ms, minMs: minDuration }
+        );
+    }
+
+    return ms;
+}
+
+
+
+
+
+
+export function validatePrize(prize) {
+    if (!prize || typeof prize !== 'string') {
+        throw new StarlightError(
+            'Prize must be a non-empty string',
+            ErrorTypes.VALIDATION,
+            'Please provide a valid prize description.',
+            { prize }
+        );
+    }
+
+    const trimmed = prize.trim();
+    if (trimmed.length === 0 || trimmed.length > 256) {
+        throw new StarlightError(
+            `Prize length out of range: ${trimmed.length}`,
+            ErrorTypes.VALIDATION,
+            'Prize must be between 1 and 256 characters.',
+            { length: trimmed.length }
+        );
+    }
+
+    return trimmed;
+}
+
+
+
+
+
+
+export function validateWinnerCount(winnerCount) {
+    if (!Number.isInteger(winnerCount) || winnerCount < 1 || winnerCount > 10) {
+        throw new StarlightError(
+            `Invalid winner count: ${winnerCount}`,
+            ErrorTypes.VALIDATION,
+            'Winner count must be between 1 and 10.',
+            { winnerCount }
+        );
+    }
+}
+
+
+
+
+
+
+
+
+export function createGiveawayEmbed(giveaway, status, winners = []) {
+    try {
+        const statusEmoji = status === 'ended' ? '🎉' : status === 'reroll' ? '🔄' : '🎉';
+        const isEnded = status === 'ended' || status === 'reroll';
+        const color = isEnded ? getColor('giveaway.ended') : getColor('giveaway.active');
+        
+        const embed = new EmbedBuilder()
+            .setTitle(`${statusEmoji} ${giveaway.prize}`)
+            .setDescription('React with the button below to enter!')
+            .setColor(color)
+            .addFields(
+                { name: '👤 Hosted by', value: `<@${giveaway.hostId}>`, inline: true },
+                { name: '🏆 Winners', value: giveaway.winnerCount.toString(), inline: true },
+                { name: '👥 Entries', value: giveaway.participants?.length?.toString() || '0', inline: true }
+            );
+
+        if (isEnded) {
+            const winnerDisplay = winners.length > 0 
+                ? winners.map(id => `<@${id}>`).join(', ')
+                : 'No valid entries';
+            embed.addFields({ name: '🎯 Winners', value: winnerDisplay, inline: false });
+        } else {
+            const endTime = giveaway.endsAt || giveaway.endTime;
+            embed.addFields({ name: '⏰ Ends', value: `<t:${Math.floor(endTime / 1000)}:R>`, inline: false });
+        }
+
+        embed.setTimestamp();
+        
+        return embed;
+    } catch (error) {
+        logger.error('Error creating giveaway embed:', error);
+        throw new StarlightError(
+            'Failed to create giveaway embed',
+            ErrorTypes.UNKNOWN,
+            'An internal error occurred while formatting the giveaway.',
+            { error: error.message }
+        );
+    }
+}
+
+
+
+
+
+
+export function createGiveawayButtons(ended = false) {
+    try {
+        const row = new ActionRowBuilder();
+
+        if (ended) {
+            row.addComponents(
+                new ButtonBuilder()
+                    .setCustomId('giveaway_reroll')
+                    .setLabel('🎲 Reroll')
+                    .setStyle(ButtonStyle.Secondary)
+                    .setDisabled(false),
+                new ButtonBuilder()
+                    .setCustomId('giveaway_view')
+                    .setLabel('👁️ View Winners')
+                    .setStyle(ButtonStyle.Primary)
+                    .setDisabled(false)
+            );
+        } else {
+            row.addComponents(
+                new ButtonBuilder()
+                    .setCustomId('giveaway_join')
+                    .setLabel('🎉 Join')
+                    .setStyle(ButtonStyle.Primary)
+                    .setDisabled(false),
+                new ButtonBuilder()
+                    .setCustomId('giveaway_end')
+                    .setLabel('🛑 End')
+                    .setStyle(ButtonStyle.Danger)
+                    .setDisabled(false)
+            );
+        }
+
+        return row;
+    } catch (error) {
+        logger.error('Error creating giveaway buttons:', error);
+        throw new StarlightError(
+            'Failed to create giveaway buttons',
+            ErrorTypes.UNKNOWN,
+            'An internal error occurred while creating interactive buttons.',
+            { error: error.message }
+        );
+    }
+}
+
+
+
+
+
+
+
+
+export function selectWinners(participants, winnerCount) {
+    if (!Array.isArray(participants) || participants.length === 0) {
+        return [];
+    }
+
+    // Ensure participants are unique
+    const uniqueParticipants = [...new Set(participants)];
+
+    if (!Number.isInteger(winnerCount) || winnerCount < 1) {
+        throw new StarlightError(
+            'Invalid winner count for selection',
+            ErrorTypes.VALIDATION,
+            'Winner count must be at least 1.',
+            { winnerCount }
+        );
+    }
+
+    const requested = Math.min(winnerCount, uniqueParticipants.length);
+    
+    try {
+        // Shuffle the unique participants using Fisher-Yates
+        const shuffled = [...uniqueParticipants];
+        for (let i = shuffled.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+        return shuffled.slice(0, requested);
+    } catch (error) {
+        logger.error('Error selecting winners:', error);
+        throw new StarlightError(
+            'Failed to select winners',
+            ErrorTypes.UNKNOWN,
+            'An error occurred while selecting winners.',
+            { error: error.message, participantCount: participants.length }
+        );
+    }
+}
+
+
+
+
+
+
+
+export function isUserRateLimited(userId, giveawayId) {
+    cleanupInteractionCache();
+
+    const key = `${userId}:${giveawayId}`;
+    const lastInteraction = userGiveawayInteractions.get(key);
+    
+    if (!lastInteraction) {
+        return false;
+    }
+
+    const elapsed = Date.now() - lastInteraction;
+    return elapsed < GIVEAWAY_INTERACTION_COOLDOWN;
+}
+
+
+
+
+
+
+export function recordUserInteraction(userId, giveawayId) {
+    cleanupInteractionCache();
+
+    const key = `${userId}:${giveawayId}`;
+    userGiveawayInteractions.set(key, Date.now());
+
+    cleanupInteractionCache(true);
+}
+
+
+
+
+
+
+
+
+
+
+export async function endGiveaway(client, giveaway, guildId, endedBy) {
+    try {
+        if (!giveaway) {
+            throw new StarlightError(
+                'Giveaway object is null or undefined',
+                ErrorTypes.VALIDATION,
+                'Cannot end a non-existent giveaway.',
+                { giveaway }
+            );
+        }
+
+        if (giveaway.ended === true || giveaway.isEnded === true) {
+            throw new StarlightError(
+                `Giveaway ${giveaway.messageId} is already ended`,
+                ErrorTypes.VALIDATION,
+                'This giveaway has already ended.',
+                { giveawayId: giveaway.messageId, status: 'already_ended' }
+            );
+        }
+
+        const participants = giveaway.participants || [];
+        const winners = selectWinners(participants, giveaway.winnerCount || 1);
+        
+        
+        const updatedGiveaway = {
+            ...giveaway,
+            ended: true,
+            isEnded: true,
+            winnerIds: winners,
+            endedAt: new Date().toISOString(),
+            endedBy: endedBy,
+            participantCount: participants.length
+        };
+
+        logger.info(`Ending giveaway ${giveaway.messageId}: selected ${winners.length} winners from ${participants.length} entries`);
+
+        return {
+            success: true,
+            giveaway: updatedGiveaway,
+            winners: winners,
+            participantCount: participants.length
+        };
+    } catch (error) {
+        if (error instanceof StarlightError) {
+            logger.debug(`Giveaway end validation error: ${error.message}`, error.context || {});
+            throw error;
+        }
+        logger.error('Error ending giveaway:', error);
+        throw new StarlightError(
+            'Failed to end giveaway',
+            ErrorTypes.UNKNOWN,
+            'An error occurred while ending the giveaway.',
+            { error: error.message, giveawayId: giveaway?.messageId }
+        );
+    }
+}
+
+/**
+ * Check for ended giveaways across all guilds and process them
+ * Uses SQL queries to find only giveaways that have ended (optimized with index)
+ * @param {Object} client - The Discord client
+ */
+export async function checkGiveaways(client) {
+  try {
+    if (!client.db) {
+      logger.warn('Database not available for giveaway check');
+      return;
+    }
+
+    // Get all giveaways that have ended (uses SQL index on ends_at)
+    const endedGiveaways = await getEndedGiveaways(client);
+    
+    if (endedGiveaways.length === 0) {
+      return;
+    }
+
+    logger.info(`Processing ${endedGiveaways.length} ended giveaways`);
+
+    for (const giveawayRecord of endedGiveaways) {
+      try {
+        const { id: giveawayId, guild_id: guildId, message_id: messageId, data: giveawayData } = giveawayRecord;
+        const giveaway = typeof giveawayData === 'string' ? JSON.parse(giveawayData) : giveawayData;
+
+        const guild = client.guilds.cache.get(guildId);
+        if (!guild) {
+          logger.debug(`Guild ${guildId} not found, skipping giveaway ${messageId}`);
+          continue;
+        }
+
+        const channel = await guild.channels.fetch(giveaway.channelId).catch(() => null);
+        if (!channel) {
+          logger.debug(`Channel ${giveaway.channelId} not found for giveaway ${messageId}`);
+          continue;
+        }
+
+        const message = await channel.messages.fetch(messageId).catch(() => null);
+        if (!message) {
+          logger.debug(`Message ${messageId} not found for giveaway in channel ${giveaway.channelId}`);
+          continue;
+        }
+
+        const participants = giveaway.participants || [];
+        const winners = selectWinners(participants, giveaway.winnerCount || 1);
+
+        const winnerMentions = winners.length > 0
+          ? winners.map(id => `<@${id}>`).join(', ')
+          : 'No valid entries!';
+
+        
+        const endedEmbed = createGiveawayEmbed(giveaway, 'ended', winners);
+
+        await message.edit({
+          embeds: [endedEmbed],
+          components: [createGiveawayButtons(true)]
+        });
+
+        
+        giveaway.ended = true;
+        giveaway.isEnded = true;
+        giveaway.winnerIds = winners;
+        giveaway.endedAt = new Date().toISOString();
+        
+        // Update in database with SQL
+        const markedSuccess = await markGiveawayEnded(client, giveawayId, giveaway);
+        if (!markedSuccess) {
+          logger.warn(`Failed to mark giveaway ${messageId} as ended in database`);
+        }
+
+        if (winners.length > 0) {
+          const winnerAnnouncement = `🎉 Congratulations ${winnerMentions}! You won the **${giveaway.prize || 'giveaway'}**! Please contact <@${giveaway.hostId}> to claim your prize.`;
+          const winnerPingMsg = await channel.send({ content: winnerAnnouncement });
+          giveaway.winnerPingMessageId = winnerPingMsg.id;
+          await markGiveawayEnded(client, giveawayId, giveaway);
+
+          
+          try {
+            await logEvent({
+              client,
+              guildId,
+              eventType: EVENT_TYPES.GIVEAWAY_WINNER,
+              data: {
+                description: `Giveaway ended with ${winners.length} winner(s)`,
+                channelId: channel.id,
+                fields: [
+                  {
+                    name: '🎁 Prize',
+                    value: giveaway.prize || 'Mystery Prize!',
+                    inline: true
+                  },
+                  {
+                    name: '🏆 Winners',
+                    value: winners.map(id => `<@${id}>`).join(', '),
+                    inline: false
+                  },
+                  {
+                    name: '👥 Entries',
+                    value: participants.length.toString(),
+                    inline: true
+                  }
+                ]
+              }
+            });
+          } catch (error) {
+            logger.debug('Error logging giveaway winner:', error);
+          }
+        } else {
+          await channel.send({ content: `The giveaway for **${giveaway.prize}** has ended with no valid entries.` });
+        }
+
+        logger.info(`Ended giveaway ${messageId} in guild ${guildId}`);
+      } catch (error) {
+        logger.error(`Error processing giveaway:`, error);
+      }
+    }
+  } catch (error) {
+    logger.error('Error checking giveaways:', error);
+  }
+}
+
+
+
+
+
+##### FILE: src\services\joinToCreateService.js
+
+
+
+
+
+
+import {
+    getJoinToCreateConfig,
+    saveJoinToCreateConfig,
+    updateJoinToCreateConfig,
+    getTemporaryChannelInfo,
+    formatChannelName as formatChannelNameUtil
+} from '../utils/database.js';
+import { logger } from '../utils/logger.js';
+import { StarlightError, ErrorTypes } from '../utils/errorHandler.js';
+import { logEvent, EVENT_TYPES } from './loggingService.js';
+import { ChannelType, PermissionFlagsBits } from 'discord.js';
+
+const CHANNEL_NAME_MAX_LENGTH = 100;
+const CHANNEL_VARIABLE_MAX_LENGTH = 32;
+const CONTROL_AND_INVISIBLE_CHARS_REGEX = /[\x00-\x1F\x7F\u200B-\u200D\uFEFF]/g;
+const ALLOWED_TEMPLATE_PLACEHOLDERS = new Set([
+    '{username}',
+    '{user_tag}',
+    '{displayName}',
+    '{display_name}',
+    '{guildName}',
+    '{guild_name}',
+    '{channelName}',
+    '{channel_name}'
+]);
+
+
+
+
+
+
+
+export function validateChannelNameTemplate(template) {
+    if (!template || typeof template !== 'string') {
+        throw new StarlightError(
+            'Invalid channel template: must be a non-empty string',
+            ErrorTypes.VALIDATION,
+            'Channel name template must be valid text.'
+        );
+    }
+
+    // Remove only control characters, keep emojis and punctuation for templates
+    const normalizedTemplate = template.normalize('NFKC').replace(CONTROL_AND_INVISIBLE_CHARS_REGEX, '').trim();
+
+    if (normalizedTemplate.length > CHANNEL_NAME_MAX_LENGTH) {
+        throw new StarlightError(
+            'Channel template exceeds maximum length',
+            ErrorTypes.VALIDATION,
+            `Channel name template cannot exceed ${CHANNEL_NAME_MAX_LENGTH} characters.`
+        );
+    }
+
+    // Check for Discord-forbidden channel name characters (only @#: and backticks are problematic)
+    if (/[@#:`]/.test(normalizedTemplate)) {
+        throw new StarlightError(
+            'Channel template contains forbidden characters',
+            ErrorTypes.VALIDATION,
+            'Channel template cannot contain @, #, :, or backtick characters.'
+        );
+    }
+
+    const placeholders = normalizedTemplate.match(/\{[^}]+\}/g) || [];
+    for (const placeholder of placeholders) {
+        if (!ALLOWED_TEMPLATE_PLACEHOLDERS.has(placeholder)) {
+            throw new StarlightError(
+                'Channel template contains unknown placeholders',
+                ErrorTypes.VALIDATION,
+                `Unknown placeholder: ${placeholder}. Allowed placeholders are ${Array.from(ALLOWED_TEMPLATE_PLACEHOLDERS).join(', ')}`
+            );
+        }
+    }
+
+    return true;
+}
+
+
+
+
+
+
+
+export function validateBitrate(bitrate) {
+    const bitrateNum = parseInt(bitrate);
+
+    if (isNaN(bitrateNum)) {
+        throw new StarlightError(
+            'Bitrate must be a valid number',
+            ErrorTypes.VALIDATION,
+            'Please enter a valid number for bitrate.'
+        );
+    }
+
+    if (bitrateNum < 8 || bitrateNum > 384) {
+        throw new StarlightError(
+            'Bitrate out of valid range',
+            ErrorTypes.VALIDATION,
+            'Bitrate must be between 8 and 384 kbps.'
+        );
+    }
+
+    return true;
+}
+
+
+
+
+
+
+
+export function validateUserLimit(limit) {
+    const limitNum = parseInt(limit);
+
+    if (isNaN(limitNum)) {
+        throw new StarlightError(
+            'User limit must be a valid number',
+            ErrorTypes.VALIDATION,
+            'Please enter a valid number for user limit.'
+        );
+    }
+
+    if (limitNum < 0 || limitNum > 99) {
+        throw new StarlightError(
+            'User limit out of valid range',
+            ErrorTypes.VALIDATION,
+            'User limit must be between 0 (no limit) and 99.'
+        );
+    }
+
+    return true;
+}
+
+
+
+
+
+
+
+
+export function formatChannelName(template, variables) {
+    try {
+        const safeTemplate = template.normalize('NFKC').replace(CONTROL_AND_INVISIBLE_CHARS_REGEX, '').trim();
+        validateChannelNameTemplate(safeTemplate);
+
+        if (!variables || typeof variables !== 'object') {
+            throw new StarlightError(
+                'Invalid variables object for channel formatting',
+                ErrorTypes.VALIDATION
+            );
+        }
+
+        // Sanitize each variable to prevent injection and ensure Discord compatibility
+        const sanitized = {};
+        for (const [key, value] of Object.entries(variables)) {
+            if (value === null || value === undefined) {
+                sanitized[key] = 'Unknown';
+            } else {
+                // Remove dangerous and Discord-incompatible characters
+                sanitized[key] = String(value)
+                    .normalize('NFKC')
+                    .replace(CONTROL_AND_INVISIBLE_CHARS_REGEX, '')
+                    .replace(/[@#:`\n\r\t]/g, '') // Remove Discord-forbidden chars
+                    .trim()
+                    .substring(0, CHANNEL_VARIABLE_MAX_LENGTH);
+            }
+        }
+
+        const replacements = {
+            '{username}': sanitized.username || 'User',
+            '{user_tag}': sanitized.userTag || 'User#0000',
+            '{displayName}': sanitized.displayName || 'User',
+            '{display_name}': sanitized.displayName || 'User',
+            '{guildName}': sanitized.guildName || 'Server',
+            '{guild_name}': sanitized.guildName || 'Server',
+            '{channelName}': sanitized.channelName || 'Voice Channel',
+            '{channel_name}': sanitized.channelName || 'Voice Channel',
+        };
+
+        let formatted = safeTemplate;
+        for (const [placeholder, value] of Object.entries(replacements)) {
+            formatted = formatted.replace(new RegExp(placeholder.replace(/[{}]/g, '\\$&'), 'g'), value);
+        }
+
+        // Final sanitization: preserve emojis but remove Discord-forbidden characters
+        // Discord allows emojis but not @#:` and control characters
+        formatted = formatted
+            .normalize('NFKC')
+            .replace(CONTROL_AND_INVISIBLE_CHARS_REGEX, '')
+            .replace(/[@#:`\n\r\t]/g, '') // Remove only Discord-forbidden chars, keep emojis
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        
+        if (formatted.length === 0) {
+            formatted = 'Voice Channel';
+        } else if (formatted.length > CHANNEL_NAME_MAX_LENGTH) {
+            formatted = formatted.substring(0, CHANNEL_NAME_MAX_LENGTH);
+        }
+
+        logger.debug(`Formatted channel name: "${formatted}" from template "${template}"`);
+        return formatted;
+
+    } catch (error) {
+        logger.error('Error formatting channel name:', error);
+        throw error;
+    }
+}
+
+
+
+
+
+
+
+
+
+export async function initializeJoinToCreate(client, guildId, channelId, options = {}) {
+    try {
+        if (!client || !client.db) {
+            throw new StarlightError(
+                'Database service not available',
+                ErrorTypes.DATABASE,
+                'System error occurred. Please try again.'
+            );
+        }
+
+        if (!guildId || !channelId) {
+            throw new StarlightError(
+                'Missing required guild or channel ID',
+                ErrorTypes.VALIDATION,
+                'Invalid guild or channel information provided.'
+            );
+        }
+
+        
+        if (options.nameTemplate) {
+            validateChannelNameTemplate(options.nameTemplate);
+        }
+        if (options.bitrate) {
+            validateBitrate(options.bitrate / 1000); 
+        }
+        if (options.userLimit !== undefined) {
+            validateUserLimit(options.userLimit);
+        }
+
+        const config = await getJoinToCreateConfig(client, guildId);
+
+        if (config.triggerChannels.includes(channelId)) {
+            throw new StarlightError(
+                'Channel already configured as Join to Create trigger',
+                ErrorTypes.VALIDATION,
+                'This channel is already set up as a Join to Create trigger.'
+            );
+        }
+
+        if (Array.isArray(config.triggerChannels) && config.triggerChannels.length > 0) {
+            throw new StarlightError(
+                'Guild already has a Join to Create trigger configured',
+                ErrorTypes.VALIDATION,
+                'This server already has a Join to Create channel configured. Use `/jointocreate dashboard` to modify it, or remove it before creating a new one.',
+                {
+                    guildId,
+                    existingTriggerChannelId: config.triggerChannels[0],
+                    expected: true,
+                    suppressErrorLog: true
+                }
+            );
+        }
+
+        config.triggerChannels.push(channelId);
+        config.enabled = true;
+
+        if (Object.keys(options).length > 0) {
+            if (!config.channelOptions) {
+                config.channelOptions = {};
+            }
+            config.channelOptions[channelId] = {
+                nameTemplate: options.nameTemplate || config.channelNameTemplate,
+                userLimit: options.userLimit !== undefined ? options.userLimit : config.userLimit,
+                bitrate: options.bitrate || config.bitrate,
+                categoryId: options.categoryId || null,
+                createdAt: Date.now()
+            };
+        }
+
+        await saveJoinToCreateConfig(client, guildId, config);
+
+        logger.info(`Initialized Join to Create for guild ${guildId} with trigger channel ${channelId}`);
+
+        return config;
+
+    } catch (error) {
+        if (error instanceof StarlightError) {
+            throw error;
+        }
+        throw new StarlightError(
+            `Failed to initialize Join to Create: ${error.message}`,
+            ErrorTypes.DATABASE,
+            'Failed to set up Join to Create system.'
+        );
+    }
+}
+
+
+
+
+
+
+
+
+
+export async function updateChannelConfig(client, guildId, channelId, updates) {
+    try {
+        if (!client || !client.db) {
+            throw new StarlightError(
+                'Database service not available',
+                ErrorTypes.DATABASE,
+                'Database service is currently unavailable. Please try again later.'
+            );
+        }
+
+        const config = await getJoinToCreateConfig(client, guildId);
+
+        if (!config.triggerChannels.includes(channelId)) {
+            throw new StarlightError(
+                'Channel is not configured as a Join to Create trigger',
+                ErrorTypes.VALIDATION,
+                'This channel is not set up as a Join to Create trigger.'
+            );
+        }
+
+        
+        if (updates.nameTemplate) {
+            validateChannelNameTemplate(updates.nameTemplate);
+        }
+        if (updates.bitrate !== undefined) {
+            validateBitrate(updates.bitrate / 1000);
+        }
+        if (updates.userLimit !== undefined) {
+            validateUserLimit(updates.userLimit);
+        }
+
+        if (!config.channelOptions) {
+            config.channelOptions = {};
+        }
+
+        config.channelOptions[channelId] = {
+            ...config.channelOptions[channelId],
+            ...updates,
+            updatedAt: Date.now()
+        };
+
+        await saveJoinToCreateConfig(client, guildId, config);
+
+        logger.info(`Updated Join to Create config for channel ${channelId} in guild ${guildId}`, {
+            updates: Object.keys(updates)
+        });
+
+        return config.channelOptions[channelId];
+
+    } catch (error) {
+        if (error instanceof StarlightError) {
+            throw error;
+        }
+        throw new StarlightError(
+            `Failed to update channel config: ${error.message}`,
+            ErrorTypes.DATABASE,
+            'Failed to update configuration.'
+        );
+    }
+}
+
+
+
+
+
+
+
+
+export async function removeTriggerChannel(client, guildId, channelId) {
+    try {
+        if (!client || !client.db) {
+            throw new StarlightError(
+                'Database service not available',
+                ErrorTypes.DATABASE,
+                'Database service is currently unavailable. Please try again later.'
+            );
+        }
+
+        const config = await getJoinToCreateConfig(client, guildId);
+
+        const index = config.triggerChannels.indexOf(channelId);
+        if (index === -1) {
+            throw new StarlightError(
+                'Channel not found in Join to Create triggers',
+                ErrorTypes.VALIDATION,
+                'This channel is not configured as a Join to Create trigger.'
+            );
+        }
+
+        config.triggerChannels.splice(index, 1);
+        config.enabled = config.triggerChannels.length > 0;
+
+        if (config.channelOptions && config.channelOptions[channelId]) {
+            delete config.channelOptions[channelId];
+        }
+
+        
+        if (config.temporaryChannels) {
+            for (const [tempChannelId, tempInfo] of Object.entries(config.temporaryChannels)) {
+                if (tempInfo.triggerChannelId === channelId) {
+                    delete config.temporaryChannels[tempChannelId];
+                }
+            }
+        }
+
+        await saveJoinToCreateConfig(client, guildId, config);
+
+        logger.info(`Removed Join to Create trigger channel ${channelId} from guild ${guildId}`);
+
+        return true;
+
+    } catch (error) {
+        if (error instanceof StarlightError) {
+            throw error;
+        }
+        throw new StarlightError(
+            `Failed to remove trigger channel: ${error.message}`,
+            ErrorTypes.DATABASE,
+            'Failed to remove trigger channel.'
+        );
+    }
+}
+
+
+
+
+
+
+
+
+export async function getConfiguration(client, guildId) {
+    try {
+        if (!client || !client.db) {
+            throw new StarlightError(
+                'Database service not available',
+                ErrorTypes.DATABASE,
+                'Database service is currently unavailable. Please try again later.'
+            );
+        }
+
+        return await getJoinToCreateConfig(client, guildId);
+
+    } catch (error) {
+        if (error instanceof StarlightError) {
+            throw error;
+        }
+        throw new StarlightError(
+            `Failed to retrieve configuration: ${error.message}`,
+            ErrorTypes.DATABASE,
+            'Failed to retrieve settings.'
+        );
+    }
+}
+
+
+
+
+
+
+
+
+export async function isTriggerChannel(client, guildId, channelId) {
+    try {
+        const config = await getConfiguration(client, guildId);
+        return config.triggerChannels.includes(channelId);
+    } catch (error) {
+        logger.error(`Error checking if channel is trigger: ${error.message}`);
+        return false;
+    }
+}
+
+
+
+
+
+
+
+
+
+export async function getChannelConfiguration(client, guildId, channelId) {
+    try {
+        const config = await getConfiguration(client, guildId);
+
+        if (!config.triggerChannels || !Array.isArray(config.triggerChannels) || !config.triggerChannels.includes(channelId)) {
+            throw new StarlightError(
+                'Channel is not a valid Join to Create trigger',
+                ErrorTypes.VALIDATION,
+                'This channel is not set up as a Join to Create trigger.'
+            );
+        }
+
+        return {
+            ...config,
+            channelConfig: config.channelOptions?.[channelId] || {}
+        };
+
+    } catch (error) {
+        if (error instanceof StarlightError) {
+            throw error;
+        }
+        throw new StarlightError(
+            `Failed to get channel configuration: ${error.message}`,
+            ErrorTypes.DATABASE,
+            'Failed to retrieve channel configuration. Please try again.'
+        );
+    }
+}
+
+
+
+
+
+
+export function hasManageGuildPermission(member) {
+    try {
+        if (!member || !member.permissions) {
+            return false;
+        }
+        return member.permissions.has(PermissionFlagsBits.ManageGuild);
+    } catch (error) {
+        logger.error('Error checking ManageGuild permission:', error);
+        return false;
+    }
+}
+
+
+
+
+
+
+
+
+
+export async function logConfigurationChange(client, guildId, userId, action, details) {
+    try {
+        await logEvent({
+            client,
+            guildId,
+            eventType: EVENT_TYPES.CONFIGURATION_CHANGE,
+            data: {
+                description: `Join to Create: ${action}`,
+                userId,
+                action,
+                details,
+                timestamp: new Date().toISOString()
+            }
+        });
+    } catch (error) {
+        logger.warn(`Failed to log Join to Create configuration change: ${error.message}`);
+    }
+}
+
+
+
+
+
+
+
+
+
+export async function createTemporaryChannel(guild, member, options = {}) {
+    try {
+        if (!guild || !member) {
+            throw new StarlightError(
+                'Invalid guild or member',
+                ErrorTypes.VALIDATION
+            );
+        }
+
+        const {
+            nameTemplate,
+            userLimit,
+            bitrate,
+            parentId
+        } = options;
+
+        
+        if (nameTemplate) {
+            validateChannelNameTemplate(nameTemplate);
+        }
+        if (userLimit !== undefined) {
+            validateUserLimit(userLimit);
+        }
+        if (bitrate !== undefined) {
+            validateBitrate(bitrate / 1000);
+        }
+
+        
+        const channelName = formatChannelName(nameTemplate || '{username}\'s Room', {
+            username: member.user.username,
+            displayName: member.displayName,
+            userTag: member.user.tag,
+            guildName: guild.name
+        });
+
+        
+        const tempChannel = await guild.channels.create({
+            name: channelName,
+            type: ChannelType.GuildVoice,
+            parent: parentId,
+            userLimit: userLimit === 0 ? undefined : userLimit,
+            bitrate: bitrate || 64000,
+            permissionOverwrites: [
+                {
+                    id: member.id,
+                    allow: [PermissionFlagsBits.Connect, PermissionFlagsBits.Speak, PermissionFlagsBits.PrioritySpeaker, PermissionFlagsBits.MoveMembers]
+                },
+                {
+                    id: guild.id,
+                    allow: [PermissionFlagsBits.Connect, PermissionFlagsBits.Speak]
+                }
+            ]
+        });
+
+        logger.info(`Created temporary voice channel ${tempChannel.name} (${tempChannel.id}) for user ${member.user.tag}`);
+
+        return {
+            id: tempChannel.id,
+            name: tempChannel.name,
+            ownerId: member.id
+        };
+
+    } catch (error) {
+        if (error instanceof StarlightError) {
+            throw error;
+        }
+        throw new StarlightError(
+            `Failed to create temporary channel: ${error.message}`,
+            ErrorTypes.DISCORD_API,
+            'Failed to create your temporary voice channel. Please contact an administrator.'
+        );
+    }
+}
+
+export default {
+    validateChannelNameTemplate,
+    validateBitrate,
+    validateUserLimit,
+    formatChannelName,
+    initializeJoinToCreate,
+    updateChannelConfig,
+    removeTriggerChannel,
+    getConfiguration,
+    isTriggerChannel,
+    getChannelConfiguration,
+    hasManageGuildPermission,
+    logConfigurationChange,
+    createTemporaryChannel
+};
+
+
+##### FILE: src\services\leveling.js
+
+
+
+
+
+import { EmbedBuilder } from 'discord.js';
+import { logger } from '../utils/logger.js';
+import { getGuildConfig, setGuildConfig } from '../services/guildConfig.js';
+import { StarlightError, ErrorTypes } from '../utils/errorHandler.js';
+import { addXp } from './xpSystem.js';
+
+
+const BASE_XP = 100;
+const XP_MULTIPLIER = 1.5;
+const MAX_LEVEL = 1000;
+const MIN_LEVEL = 0;
+
+
+
+
+
+
+
+export function getXpForLevel(level) {
+  if (!Number.isInteger(level) || level < 0 || level > MAX_LEVEL) {
+    throw new StarlightError(
+      `Invalid level: ${level}. Must be between ${MIN_LEVEL} and ${MAX_LEVEL}`,
+      ErrorTypes.VALIDATION,
+      'The level must be a valid number.'
+    );
+  }
+  return 5 * Math.pow(level, 2) + 50 * level + 50;
+}
+
+
+
+
+
+
+export function getLevelFromXp(xp) {
+  if (!Number.isInteger(xp) || xp < 0) {
+    throw new StarlightError(
+      `Invalid XP: ${xp}`,
+      ErrorTypes.VALIDATION,
+      'XP must be a non-negative number.'
+    );
+  }
+
+  let level = 0;
+  let xpNeeded = 0;
+  
+  while (xp >= getXpForLevel(level) && level < MAX_LEVEL) {
+    xpNeeded = getXpForLevel(level);
+    xp -= xpNeeded;
+    level++;
+  }
+  
+  return {
+    level: Math.min(level, MAX_LEVEL),
+    currentXp: xp,
+    xpNeeded: getXpForLevel(Math.min(level, MAX_LEVEL))
+  };
+}
+
+
+
+
+
+
+
+
+/**
+ * Calculate the total XP required for a specific level and current XP
+ * @param {number} level - The target level
+ * @param {number} currentXp - Current XP progress towards next level
+ * @returns {number} Total accumulated XP
+ */
+export function calculateTotalXp(level, currentXp = 0) {
+  let total = currentXp;
+  for (let i = 0; i < level; i++) {
+    total += getXpForLevel(i);
+  }
+  return total;
+}
+
+export async function getLeaderboard(client, guildId, limit = 10) {
+  try {
+    
+    if (!guildId || typeof guildId !== 'string') {
+      throw new StarlightError(
+        'Invalid guild ID',
+        ErrorTypes.VALIDATION,
+        'Guild ID is required.'
+      );
+    }
+
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      limit = Math.min(Math.max(limit, 1), 100);
+    }
+
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) {
+      logger.warn(`Guild ${guildId} not found in cache`);
+      return [];
+    }
+    
+    const members = await guild.members.fetch().catch(error => {
+      logger.error(`Failed to fetch members for guild ${guildId}:`, error);
+      return new Map();
+    });
+
+    const leaderboard = [];
+    
+    for (const [userId, member] of members) {
+      if (member.user.bot) continue;
+      
+      const data = await getUserLevelData(client, guildId, userId);
+      if (data && (data.totalXp > 0 || data.level > 0)) {
+        leaderboard.push({
+          userId,
+          username: member.user.username,
+          discriminator: member.user.discriminator,
+          ...data
+        });
+      }
+    }
+    
+    leaderboard.sort((a, b) => b.totalXp - a.totalXp);
+    
+    leaderboard.forEach((entry, index) => {
+      entry.rank = index + 1;
+    });
+    
+    return leaderboard.slice(0, limit);
+    
+  } catch (error) {
+    logger.error('Error getting leaderboard:', error);
+    if (error instanceof StarlightError) throw error;
+    throw new StarlightError(
+      `Failed to fetch leaderboard: ${error.message}`,
+      ErrorTypes.DATABASE,
+      'Could not fetch the leaderboard at this time.'
+    );
+  }
+}
+
+
+
+
+
+
+
+export function createLeaderboardEmbed(leaderboard, guild) {
+  const embed = new EmbedBuilder()
+    .setTitle(`🏆 ${guild.name} Leaderboard`)
+    .setColor('#2ecc71')
+    .setTimestamp();
+    
+  if (!leaderboard || leaderboard.length === 0) {
+    embed.setDescription('No users on the leaderboard yet!');
+    return embed;
+  }
+  
+  const top3 = leaderboard.slice(0, 3);
+  const rest = leaderboard.slice(3);
+  
+  const top3Text = top3.map((user, index) => {
+    const medal = ['🥇', '🥈', '🥉'][index];
+    return `${medal} **#${user.rank}** ${user.username} - Level ${user.level} (${user.totalXp} XP)`;
+  }).join('\n');
+  
+  const restText = rest.map(user => {
+    return `**#${user.rank}** ${user.username} - Level ${user.level} (${user.totalXp} XP)`;
+  }).join('\n');
+  
+  embed.setDescription(
+    `**Top Members**\n${top3Text}${restText ? '\n\n' + restText : ''}`
+  );
+  
+  return embed;
+}
+
+
+
+
+
+
+
+export async function getLevelingConfig(client, guildId) {
+  try {
+    const guildConfig = await getGuildConfig(client, guildId);
+    return guildConfig.leveling || {
+      enabled: true,
+      xpPerMessage: { min: 15, max: 25 },
+      xpCooldown: 20,
+      levelUpMessage: '{user} has leveled up to level {level}!',
+      levelUpChannel: null,
+      ignoredChannels: [],
+      ignoredRoles: [],
+      blacklistedUsers: [],
+      roleRewards: {},
+      announceLevelUp: true,
+      xpMultiplier: 1
+    };
+  } catch (error) {
+    logger.error(`Error getting leveling config for guild ${guildId}:`, error);
+    return {
+      enabled: true,
+      xpPerMessage: { min: 15, max: 25 },
+      xpCooldown: 20,
+      levelUpMessage: '{user} has leveled up to level {level}!',
+      levelUpChannel: null,
+      ignoredChannels: [],
+      ignoredRoles: [],
+      blacklistedUsers: [],
+      roleRewards: {},
+      announceLevelUp: true,
+      xpMultiplier: 1
+    };
+  }
+}
+
+
+
+
+
+
+
+
+export async function getUserLevelData(client, guildId, userId) {
+  try {
+    if (!guildId || !userId) {
+      throw new StarlightError(
+        'Guild ID and User ID are required',
+        ErrorTypes.VALIDATION
+      );
+    }
+
+    const key = `${guildId}:leveling:users:${userId}`;
+    const data = await client.db.get(key);
+    
+    if (!data) {
+      return {
+        xp: 0,
+        level: 0,
+        totalXp: 0,
+        lastMessage: 0,
+        rank: 0
+      };
+    }
+    
+    return {
+      xp: Math.max(0, data.xp || 0),
+      level: Math.max(0, Math.min(data.level || 0, MAX_LEVEL)),
+      totalXp: Math.max(0, data.totalXp || 0),
+      lastMessage: data.lastMessage || 0,
+      rank: data.rank || 0
+    };
+  } catch (error) {
+    logger.error(`Error getting user level data for ${userId}:`, error);
+    if (error instanceof StarlightError) throw error;
+    throw new StarlightError(
+      `Failed to fetch user data: ${error.message}`,
+      ErrorTypes.DATABASE,
+      'Could not fetch level data at this time.'
+    );
+  }
+}
+
+
+
+
+
+
+
+
+
+export async function saveUserLevelData(client, guildId, userId, data) {
+  try {
+    if (!guildId || !userId) {
+      throw new StarlightError(
+        'Guild ID and User ID are required',
+        ErrorTypes.VALIDATION
+      );
+    }
+
+    
+    if (!data || typeof data !== 'object') {
+      throw new StarlightError(
+        'Invalid user level data',
+        ErrorTypes.VALIDATION
+      );
+    }
+
+    
+    const sanitizedData = {
+      xp: Math.max(0, Number(data.xp) || 0),
+      level: Math.max(0, Math.min(Number(data.level) || 0, MAX_LEVEL)),
+      totalXp: Math.max(0, Number(data.totalXp) || 0),
+      lastMessage: Number(data.lastMessage) || 0,
+      rank: Number(data.rank) || 0
+    };
+
+    const key = `${guildId}:leveling:users:${userId}`;
+    await client.db.set(key, sanitizedData);
+  } catch (error) {
+    logger.error(`Error saving user level data for ${userId}:`, error);
+    if (error instanceof StarlightError) throw error;
+    throw new StarlightError(
+      `Failed to save user data: ${error.message}`,
+      ErrorTypes.DATABASE,
+      'Could not save level data at this time.'
+    );
+  }
+}
+
+
+
+
+
+
+
+
+export async function saveLevelingConfig(client, guildId, config) {
+  try {
+    if (!guildId || !config) {
+      throw new StarlightError(
+        'Guild ID and config are required',
+        ErrorTypes.VALIDATION
+      );
+    }
+
+    const guildConfig = await getGuildConfig(client, guildId);
+    
+    
+    if (config.xpCooldown && (config.xpCooldown < 0 || config.xpCooldown > 3600)) {
+      throw new StarlightError(
+        'XP cooldown must be between 0 and 3600 seconds',
+        ErrorTypes.VALIDATION,
+        'Cooldown must be between 0 and 3600 seconds.'
+      );
+    }
+
+    if (config.xpRange && (config.xpRange.min < 1 || config.xpRange.max < 1 || config.xpRange.min > config.xpRange.max)) {
+      throw new StarlightError(
+        'Invalid XP range configuration',
+        ErrorTypes.VALIDATION,
+        'Minimum XP must be less than maximum XP, and both must be positive.'
+      );
+    }
+
+    guildConfig.leveling = config;
+    await setGuildConfig(client, guildId, guildConfig);
+    
+    logger.info(`Leveling config updated for guild ${guildId}`);
+  } catch (error) {
+    logger.error(`Error saving leveling config for guild ${guildId}:`, error);
+    if (error instanceof StarlightError) throw error;
+    throw new StarlightError(
+      `Failed to save config: ${error.message}`,
+      ErrorTypes.DATABASE,
+      'Could not save configuration at this time.'
+    );
+  }
+}
+
+
+
+
+
+
+
+
+
+export async function addLevels(client, guildId, userId, levels) {
+  try {
+    const levelingConfig = await getLevelingConfig(client, guildId);
+    if (!levelingConfig?.enabled) {
+      throw new StarlightError(
+        'Leveling system is disabled on this server',
+        ErrorTypes.CONFIGURATION,
+        'The leveling system is currently disabled on this server.'
+      );
+    }
+
+    
+    if (!Number.isInteger(levels) || levels <= 0) {
+      throw new StarlightError(
+        `Invalid level amount: ${levels}`,
+        ErrorTypes.VALIDATION,
+        'You must add a positive number of levels.'
+      );
+    }
+
+    const userData = await getUserLevelData(client, guildId, userId);
+    const newLevel = userData.level + levels;
+
+    if (newLevel > MAX_LEVEL) {
+      throw new StarlightError(
+        `Level ${newLevel} exceeds maximum level ${MAX_LEVEL}`,
+        ErrorTypes.VALIDATION,
+        `Maximum level is ${MAX_LEVEL}.`
+      );
+    }
+
+    const newXp = 0;
+    const newTotalXp = calculateTotalXp(newLevel, newXp);
+
+    userData.level = newLevel;
+    userData.xp = newXp;
+    userData.totalXp = newTotalXp;
+
+    await saveUserLevelData(client, guildId, userId, userData);
+    
+    logger.info(`Added ${levels} levels to user ${userId} in guild ${guildId}`);
+    return userData;
+  } catch (error) {
+    logger.error(`Error adding levels for user ${userId}:`, error);
+    if (error instanceof StarlightError) throw error;
+    throw new StarlightError(
+      `Failed to add levels: ${error.message}`,
+      ErrorTypes.DATABASE,
+      'Could not add levels at this time.'
+    );
+  }
+}
+
+
+
+
+
+
+
+
+
+export async function removeLevels(client, guildId, userId, levels) {
+  try {
+    const levelingConfig = await getLevelingConfig(client, guildId);
+    if (!levelingConfig?.enabled) {
+      throw new StarlightError(
+        'Leveling system is disabled on this server',
+        ErrorTypes.CONFIGURATION,
+        'The leveling system is currently disabled on this server.'
+      );
+    }
+
+    
+    if (!Number.isInteger(levels) || levels <= 0) {
+      throw new StarlightError(
+        `Invalid level amount: ${levels}`,
+        ErrorTypes.VALIDATION,
+        'You must remove a positive number of levels.'
+      );
+    }
+
+    const userData = await getUserLevelData(client, guildId, userId);
+    const newLevel = Math.max(MIN_LEVEL, userData.level - levels);
+
+    const newXp = 0;
+    const newTotalXp = calculateTotalXp(newLevel, newXp);
+
+    userData.level = newLevel;
+    userData.xp = newXp;
+    userData.totalXp = newTotalXp;
+
+    await saveUserLevelData(client, guildId, userId, userData);
+    
+    logger.info(`Removed ${levels} levels from user ${userId} in guild ${guildId}`);
+    return userData;
+  } catch (error) {
+    logger.error(`Error removing levels for user ${userId}:`, error);
+    if (error instanceof StarlightError) throw error;
+    throw new StarlightError(
+      `Failed to remove levels: ${error.message}`,
+      ErrorTypes.DATABASE,
+      'Could not remove levels at this time.'
+    );
+  }
+}
+
+
+
+
+
+
+
+
+
+export async function setUserLevel(client, guildId, userId, level) {
+  try {
+    const levelingConfig = await getLevelingConfig(client, guildId);
+    if (!levelingConfig?.enabled) {
+      throw new StarlightError(
+        'Leveling system is disabled on this server',
+        ErrorTypes.CONFIGURATION,
+        'The leveling system is currently disabled on this server.'
+      );
+    }
+
+    
+    if (!Number.isInteger(level) || level < MIN_LEVEL || level > MAX_LEVEL) {
+      throw new StarlightError(
+        `Invalid level: ${level}`,
+        ErrorTypes.VALIDATION,
+        `Level must be between ${MIN_LEVEL} and ${MAX_LEVEL}.`
+      );
+    }
+
+    const userData = await getUserLevelData(client, guildId, userId);
+    
+    const newXp = 0;
+    const newTotalXp = calculateTotalXp(level, newXp);
+
+    userData.level = level;
+    userData.xp = newXp;
+    userData.totalXp = newTotalXp;
+
+    await saveUserLevelData(client, guildId, userId, userData);
+    
+    logger.info(`Set level for user ${userId} to ${level} in guild ${guildId}`);
+    return userData;
+  } catch (error) {
+    logger.error(`Error setting level for user ${userId}:`, error);
+    if (error instanceof StarlightError) throw error;
+    throw new StarlightError(
+      `Failed to set level: ${error.message}`,
+      ErrorTypes.DATABASE,
+      'Could not set level at this time.'
+    );
+  }
+}
+
+
+
+
+export async function deleteUserLevelData(client, guildId, userId) {
+  try {
+    if (!guildId || !userId) {
+      throw new StarlightError(
+        'Guild ID and User ID are required',
+        ErrorTypes.VALIDATION
+      );
+    }
+
+    const key = `${guildId}:leveling:users:${userId}`;
+    await client.db.delete(key);
+    
+    logger.debug(`Deleted level data for user ${userId} in guild ${guildId}`);
+  } catch (error) {
+    logger.error(`Error deleting level data for user ${userId}:`, error);
+    if (error instanceof StarlightError) throw error;
+    logger.warn(`Could not delete level data for user ${userId} in guild ${guildId}`);
+  }
+}
+
+
+
+
+
+##### FILE: src\services\pendingTimeoutService.js
+import { getTimeoutChunkMs, getTimeoutEndsISO } from '../utils/timeouts.js';
+import { logger } from '../utils/logger.js';
+
+import { pgDb } from '../utils/postgresDatabase.js';
+
+
+const CHUNK_DUE_LIMIT = 50;
+
+function toMsFromBigInt(value) {
+  if (value === null || value === undefined) return 0;
+  if (typeof value === 'bigint') return Number(value);
+  return Number(value);
+}
+
+async function claimDue(client, now) {
+  // Claim: move pending->running for due jobs to avoid double-processing
+  // Note: without SKIP LOCKED (depending on postgres/driver), we still rely on status update.
+  const result = await client.query(
+    `SELECT id, guild_id, user_id, remaining_duration_ms, resume_at, reason, status
+     FROM pending_timeouts
+     WHERE status = 'pending' AND resume_at <= $1
+     ORDER BY resume_at ASC
+     LIMIT ${CHUNK_DUE_LIMIT}
+    `,
+    [now]
+  );
+
+  const rows = result.rows || [];
+  if (rows.length === 0) return [];
+
+  const ids = rows.map((r) => r.id);
+  // Mark claimed rows as running
+  await client.query(
+    `UPDATE pending_timeouts
+     SET status = 'running', updated_at = NOW()
+     WHERE id = ANY($1::bigint[]) AND status = 'pending'`,
+    [ids]
+  );
+
+  return rows;
+}
+
+async function fetchMember(client, guildId, userId) {
+  const guild = client.guilds.cache.get(guildId) || (await client.guilds.fetch(guildId).catch(() => null));
+  if (!guild) return null;
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  return member;
+}
+
+async function processOne(client, discordClient, job) {
+  const {
+    id,
+    guild_id: guildId,
+    user_id: userId,
+    remaining_duration_ms: remainingMsRaw,
+    reason,
+  } = job;
+
+  const remainingMs = toMsFromBigInt(remainingMsRaw);
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    await client.query(`DELETE FROM pending_timeouts WHERE id = $1`, [id]);
+    logger.warn('pendingTimeoutService: deleted invalid remaining ms job', { id, remainingMs });
+    return;
+  }
+
+  const chunkMs = getTimeoutChunkMs(remainingMs);
+  const member = await fetchMember(discordClient, guildId, userId);
+  if (!member) {
+    await client.query(`DELETE FROM pending_timeouts WHERE id = $1`, [id]);
+    logger.warn('pendingTimeoutService: member not found, deleting job', { id, guildId, userId });
+    return;
+  }
+
+  if (!member.moderatable) {
+    await client.query(
+      `UPDATE pending_timeouts SET status='failed', processed_at=NOW(), updated_at=NOW() WHERE id=$1`,
+      [id]
+    );
+    logger.warn('pendingTimeoutService: member not moderatable, marking failed', { id, guildId, userId });
+    return;
+  }
+
+  const endsISO = getTimeoutEndsISO(chunkMs);
+
+  await member.timeout(chunkMs, reason);
+
+  const newRemainingMs = remainingMs - chunkMs;
+
+  if (newRemainingMs <= 0) {
+    await client.query(`DELETE FROM pending_timeouts WHERE id = $1`, [id]);
+    logger.info('pendingTimeoutService: completed pending timeout', {
+      id,
+      guildId,
+      userId,
+      chunkMs,
+      endsISO,
+    });
+  } else {
+    const nextResumeAt = new Date(Date.now() + chunkMs);
+    await client.query(
+      `UPDATE pending_timeouts
+       SET remaining_duration_ms = $1, resume_at = $2, status = 'pending', processed_at = NOW(), updated_at = NOW()
+       WHERE id = $3`,
+      [BigInt(newRemainingMs), nextResumeAt.toISOString(), id]
+    );
+
+    logger.info('pendingTimeoutService: rescheduled remaining pending timeout', {
+      id,
+      guildId,
+      userId,
+      chunkMs,
+      newRemainingMs,
+      nextResumeAt: nextResumeAt.toISOString(),
+      endsISO,
+    });
+  }
+}
+
+export async function catchUpOnce(discordClient) {
+  if (!pgDb?.pool) {
+    logger.warn('pendingTimeoutService: pgDb.pool not available. Skipping catch-up.');
+    return;
+  }
+
+  const client = await pgDb.pool.connect();
+  try {
+    const now = new Date().toISOString();
+
+    let jobs = [];
+    try {
+      jobs = await claimDue(client, now);
+    } catch (err) {
+      // If migrations haven't been applied yet, pending_timeouts table won't exist.
+      if (err?.code === '42P01') {
+        logger.warn('pendingTimeoutService: pending_timeouts table not found; skipping catch-up until migrations are applied', {
+          error: err?.message,
+        });
+        return;
+      }
+      throw err;
+    }
+
+    for (const job of jobs) {
+      try {
+        await processOne(client, discordClient, job);
+      } catch (e) {
+        logger.error('pendingTimeoutService: failed to process pending timeout job', { jobId: job.id, error: e });
+        // Do not throw; continue others
+        try {
+          await client.query(
+            `UPDATE pending_timeouts SET status='failed', processed_at=NOW(), updated_at=NOW() WHERE id=$1`,
+            [job.id]
+          );
+        } catch {}
+      }
+    }
+  } finally {
+    client.release();
+  }
+}
+
+
+export async function resumeDuePendingTimeouts(discordClient) {
+  await catchUpOnce(discordClient);
+}
+
+
+
+##### FILE: src\services\reactionRoleService.js
+import { logger } from '../utils/logger.js';
+import { createError, ErrorTypes } from '../utils/errorHandler.js';
+
+
+
+
+const MAX_ROLES_PER_MESSAGE = 25;
+
+
+
+
+const DANGEROUS_PERMISSIONS = [
+    'Administrator',
+    'ManageGuild',
+    'ManageRoles',
+    'ManageChannels',
+    'ManageWebhooks',
+    'BanMembers',
+    'KickMembers'
+];
+
+
+
+
+
+
+function validateGuildId(guildId) {
+    if (!guildId || typeof guildId !== 'string' || !/^\d{17,19}$/.test(guildId)) {
+        throw createError(
+            `Invalid guild ID: ${guildId}`,
+            ErrorTypes.VALIDATION,
+            'Invalid server ID provided.',
+            { guildId }
+        );
+    }
+}
+
+
+
+
+
+
+function validateMessageId(messageId) {
+    if (!messageId || typeof messageId !== 'string' || !/^\d{17,19}$/.test(messageId)) {
+        throw createError(
+            `Invalid message ID: ${messageId}`,
+            ErrorTypes.VALIDATION,
+            'Invalid message ID provided.',
+            { messageId }
+        );
+    }
+}
+
+
+
+
+
+
+function validateRoleId(roleId) {
+    if (!roleId || typeof roleId !== 'string' || !/^\d{17,19}$/.test(roleId)) {
+        throw createError(
+            `Invalid role ID: ${roleId}`,
+            ErrorTypes.VALIDATION,
+            'Invalid role ID provided.',
+            { roleId }
+        );
+    }
+}
+
+
+
+
+
+
+export function hasDangerousPermissions(role) {
+    if (!role || !role.permissions) return false;
+    
+    for (const permission of DANGEROUS_PERMISSIONS) {
+        if (role.permissions.has(permission)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+async function validateRoleSafety(client, guildId, roleId) {
+    const guild = client.guilds?.cache?.get(guildId) || await client.guilds?.fetch?.(guildId).catch(() => null);
+    if (!guild) {
+        throw createError(
+            `Guild not found for role validation: ${guildId}`,
+            ErrorTypes.VALIDATION,
+            'Server not found while validating reaction roles.',
+            { guildId, roleId }
+        );
+    }
+
+    const role = guild.roles.cache.get(roleId) || await guild.roles.fetch(roleId).catch(() => null);
+    if (!role) {
+        throw createError(
+            `Role not found: ${roleId}`,
+            ErrorTypes.VALIDATION,
+            'One or more selected roles no longer exist.',
+            { guildId, roleId }
+        );
+    }
+
+    if (hasDangerousPermissions(role)) {
+        throw createError(
+            `Dangerous role permission detected: ${roleId}`,
+            ErrorTypes.PERMISSION,
+            'For security reasons, high-privilege roles cannot be assigned through reaction roles.',
+            { guildId, roleId, roleName: role.name, dangerousPermissions: DANGEROUS_PERMISSIONS }
+        );
+    }
+
+    const botHighestRole = guild.members.me?.roles?.highest;
+    if (!botHighestRole || role.position >= botHighestRole.position) {
+        throw createError(
+            `Role above bot hierarchy: ${roleId}`,
+            ErrorTypes.PERMISSION,
+            'I cannot assign this role because it is equal to or above my highest role.',
+            { guildId, roleId, rolePosition: role.position, botRolePosition: botHighestRole?.position }
+        );
+    }
+}
+
+/**
+ * Get the reaction role message from the database
+ * @param {Object} client - The Discord client
+ * @param {string} guildId - The guild ID
+ * @param {string} messageId - The message ID
+ * @returns {Promise<Object|null>} The reaction role message or null if not found
+ * @throws {StarlightError} If validation fails or database error occurs
+ */
+export async function getReactionRoleMessage(client, guildId, messageId) {
+    try {
+        validateGuildId(guildId);
+        validateMessageId(messageId);
+        
+        const key = `reaction_roles:${guildId}:${messageId}`;
+        const data = await client.db.get(key);
+        return data || null;
+    } catch (error) {
+        if (error.name === 'StarlightError') {
+            throw error;
+        }
+        logger.error(`Error getting reaction role message ${messageId} in guild ${guildId}:`, error);
+        throw createError(
+            `Database error retrieving reaction role message`,
+            ErrorTypes.DATABASE,
+            'Failed to retrieve reaction role data. Please try again.',
+            { guildId, messageId, originalError: error.message }
+        );
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+export async function createReactionRoleMessage(client, guildId, channelId, messageId, roleIds) {
+    try {
+        validateGuildId(guildId);
+        validateMessageId(messageId);
+        
+        if (!channelId || typeof channelId !== 'string' || !/^\d{17,19}$/.test(channelId)) {
+            throw createError(
+                `Invalid channel ID: ${channelId}`,
+                ErrorTypes.VALIDATION,
+                'Invalid channel ID provided.',
+                { channelId }
+            );
+        }
+        
+        if (!Array.isArray(roleIds) || roleIds.length === 0) {
+            throw createError(
+                'No roles provided',
+                ErrorTypes.VALIDATION,
+                'You must provide at least one role.',
+                { roleIds }
+            );
+        }
+        
+        if (roleIds.length > MAX_ROLES_PER_MESSAGE) {
+            throw createError(
+                `Too many roles: ${roleIds.length}`,
+                ErrorTypes.VALIDATION,
+                `You can only add up to ${MAX_ROLES_PER_MESSAGE} roles per reaction role message.`,
+                { roleIds, limit: MAX_ROLES_PER_MESSAGE }
+            );
+        }
+        
+        
+        for (const roleId of roleIds) {
+            validateRoleId(roleId);
+            await validateRoleSafety(client, guildId, roleId);
+        }
+        
+        const reactionRoleData = {
+            guildId,
+            channelId,
+            messageId,
+            roles: roleIds,
+            createdAt: new Date().toISOString()
+        };
+        
+        const key = `reaction_roles:${guildId}:${messageId}`;
+        await client.db.set(key, reactionRoleData);
+        
+        logger.info(`Created reaction role message ${messageId} in guild ${guildId} with ${roleIds.length} roles`);
+        return reactionRoleData;
+    } catch (error) {
+        if (error.name === 'StarlightError') {
+            throw error;
+        }
+        logger.error(`Error creating reaction role message in guild ${guildId}:`, error);
+        throw createError(
+            `Database error creating reaction role message`,
+            ErrorTypes.DATABASE,
+            'Failed to save reaction role data. Please try again.',
+            { guildId, messageId, originalError: error.message }
+        );
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+export async function addReactionRole(client, guildId, messageId, emoji, roleId) {
+    try {
+        validateGuildId(guildId);
+        validateMessageId(messageId);
+        validateRoleId(roleId);
+        await validateRoleSafety(client, guildId, roleId);
+        
+        const key = `reaction_roles:${guildId}:${messageId}`;
+        const data = await getReactionRoleMessage(client, guildId, messageId) || {
+            messageId,
+            guildId,
+            channelId: '',
+            roles: {}
+        };
+
+        data.roles[emoji] = roleId;
+        
+        await client.db.set(key, data);
+        logger.info(`Added reaction role for emoji ${emoji} to message ${messageId} in guild ${guildId}`);
+        return true;
+    } catch (error) {
+        if (error.name === 'StarlightError') {
+            throw error;
+        }
+        logger.error(`Error adding reaction role in guild ${guildId}:`, error);
+        throw createError(
+            `Database error adding reaction role`,
+            ErrorTypes.DATABASE,
+            'Failed to add reaction role. Please try again.',
+            { guildId, messageId, originalError: error.message }
+        );
+    }
+}
+
+
+
+
+
+
+
+
+
+export async function deleteReactionRoleMessage(client, guildId, messageId) {
+    try {
+        validateGuildId(guildId);
+        validateMessageId(messageId);
+        
+        const key = `reaction_roles:${guildId}:${messageId}`;
+        const data = await getReactionRoleMessage(client, guildId, messageId);
+        
+        if (!data) {
+            // Data doesn't exist - this is fine, just return (idempotent delete)
+            logger.debug(`Reaction role message ${messageId} does not exist in guild ${guildId}, nothing to delete`);
+            return true;
+        }
+        
+        await client.db.delete(key);
+        logger.info(`Deleted reaction role message ${messageId} in guild ${guildId}`);
+        return true;
+    } catch (error) {
+        if (error.name === 'StarlightError') {
+            throw error;
+        }
+        logger.error(`Error deleting reaction role message in guild ${guildId}:`, error);
+        throw createError(
+            `Database error deleting reaction role message`,
+            ErrorTypes.DATABASE,
+            'Failed to delete reaction role message. Please try again.',
+            { guildId, messageId, originalError: error.message }
+        );
+    }
+}
+
+
+
+
+
+
+
+
+
+
+export async function removeReactionRole(client, guildId, messageId, emoji) {
+    try {
+        validateGuildId(guildId);
+        validateMessageId(messageId);
+        
+        const key = `reaction_roles:${guildId}:${messageId}`;
+        const data = await getReactionRoleMessage(client, guildId, messageId);
+        
+        if (!data || !data.roles[emoji]) {
+            return false;
+        }
+
+        delete data.roles[emoji];
+
+        if (Object.keys(data.roles).length === 0) {
+            await client.db.delete(key);
+            logger.info(`Removed last reaction role from message ${messageId}, deleted message data`);
+        } else {
+            await client.db.set(key, data);
+            logger.info(`Removed reaction role for emoji ${emoji} from message ${messageId}`);
+        }
+        
+        return true;
+    } catch (error) {
+        if (error.name === 'StarlightError') {
+            throw error;
+        }
+        logger.error(`Error removing reaction role in guild ${guildId}:`, error);
+        throw createError(
+            `Database error removing reaction role`,
+            ErrorTypes.DATABASE,
+            'Failed to remove reaction role. Please try again.',
+            { guildId, messageId, originalError: error.message }
+        );
+    }
+}
+
+/**
+ * Get all reaction role messages for a guild
+ * @param {Object} client - The Discord client
+ * @param {string} guildId - The guild ID
+ * @returns {Promise<Array>} Array of reaction role messages
+ * @throws {StarlightError} If validation fails or database error occurs
+ */
+export async function getAllReactionRoleMessages(client, guildId) {
+    try {
+        validateGuildId(guildId);
+        
+        const prefix = `reaction_roles:${guildId}:`;
+        
+        let keys;
+        try {
+            keys = await client.db.list(prefix);
+            
+            if (keys && typeof keys === 'object') {
+                if (Array.isArray(keys)) {
+                    
+                } else if (keys.value && Array.isArray(keys.value)) {
+                    keys = keys.value;
+                } else {
+                    const allKeys = await client.db.list();
+                    
+                    if (Array.isArray(allKeys)) {
+                        keys = allKeys.filter(key => key.startsWith(prefix));
+                    } else if (allKeys.value && Array.isArray(allKeys.value)) {
+                        keys = allKeys.value.filter(key => key.startsWith(prefix));
+                    } else {
+                        return [];
+                    }
+                }
+            } else {
+                return [];
+            }
+        } catch (listError) {
+            logger.error(`Error listing reaction role keys for guild ${guildId}:`, listError);
+            throw createError(
+                'Database error listing reaction roles',
+                ErrorTypes.DATABASE,
+                'Failed to retrieve reaction role list. Please try again.',
+                { guildId, originalError: listError.message }
+            );
+        }
+        
+        if (!keys || keys.length === 0) {
+            return [];
+        }
+
+        const messages = [];
+        
+        for (const key of keys) {
+            try {
+                const data = await client.db.get(key);
+                
+                if (data) {
+                    let actualData;
+                    if (data && data.ok && data.value) {
+                        actualData = data.value;
+                    } else if (data && data.value) {
+                        actualData = data.value;
+                    } else {
+                        actualData = data;
+                    }
+                    
+                    if (actualData && actualData.messageId && actualData.channelId) {
+                        messages.push(actualData);
+                    } else if (actualData) {
+                        logger.warn(`Skipping malformed reaction role data for guild ${guildId}:`, actualData);
+                    }
+                }
+            } catch (dataError) {
+                logger.warn(`Error getting data for reaction role key ${key}:`, dataError);
+                
+            }
+        }
+
+        return messages;
+    } catch (error) {
+        if (error.name === 'StarlightError') {
+            throw error;
+        }
+        logger.error(`Error getting all reaction role messages for guild ${guildId}:`, error);
+        throw createError(
+            'Database error retrieving reaction roles',
+            ErrorTypes.DATABASE,
+            'Failed to retrieve reaction role messages. Please try again.',
+            { guildId, originalError: error.message }
+        );
+    }
+}
+
+
+
+
+
+
+
+
+
+
+export async function setReactionRoleChannel(client, guildId, messageId, channelId) {
+    try {
+        validateGuildId(guildId);
+        validateMessageId(messageId);
+        
+        if (!channelId || typeof channelId !== 'string' || !/^\d{17,19}$/.test(channelId)) {
+            throw createError(
+                `Invalid channel ID: ${channelId}`,
+                ErrorTypes.VALIDATION,
+                'Invalid channel ID provided.',
+                { channelId }
+            );
+        }
+        
+        const key = `reaction_roles:${guildId}:${messageId}`;
+        const data = await getReactionRoleMessage(client, guildId, messageId) || {
+            messageId,
+            guildId,
+            channelId: '',
+            roles: {}
+        };
+
+        data.channelId = channelId;
+        await client.db.set(key, data);
+        logger.info(`Set channel ${channelId} for reaction role message ${messageId}`);
+        return true;
+    } catch (error) {
+        if (error.name === 'StarlightError') {
+            throw error;
+        }
+        logger.error(`Error setting channel for reaction role message ${messageId}:`, error);
+        throw createError(
+            `Database error setting reaction role channel`,
+            ErrorTypes.DATABASE,
+            'Failed to update reaction role channel. Please try again.',
+            { guildId, messageId, channelId, originalError: error.message }
+        );
+    }
+}
+
+/**
+ * Reconcile reaction role messages against Discord state and remove stale database entries.
+ * Useful on startup to clean records for messages/channels deleted while the bot was offline.
+ * @param {Object} client - The Discord client
+ * @param {string} [guildId] - Optional guild ID to reconcile. If omitted, reconciles all guilds.
+ * @returns {Promise<Object>} Cleanup summary
+ */
+export async function reconcileReactionRoleMessages(client, guildId = null) {
+    const summary = {
+        scannedGuilds: 0,
+        scannedMessages: 0,
+        removedMessages: 0,
+        errors: 0
+    };
+
+    try {
+        const targetGuildIds = guildId
+            ? [guildId]
+            : Array.from(client.guilds.cache.keys());
+
+        for (const targetGuildId of targetGuildIds) {
+            summary.scannedGuilds += 1;
+
+            let reactionRoleMessages = [];
+            try {
+                reactionRoleMessages = await getAllReactionRoleMessages(client, targetGuildId);
+            } catch (error) {
+                summary.errors += 1;
+                logger.warn(`Failed to fetch reaction role messages for reconciliation in guild ${targetGuildId}:`, error);
+                continue;
+            }
+
+            if (!reactionRoleMessages.length) {
+                continue;
+            }
+
+            const guild = client.guilds.cache.get(targetGuildId) || await client.guilds.fetch(targetGuildId).catch(() => null);
+            if (!guild) {
+                for (const reactionRoleMessage of reactionRoleMessages) {
+                    summary.scannedMessages += 1;
+                    await client.db.delete(`reaction_roles:${targetGuildId}:${reactionRoleMessage.messageId}`);
+                    summary.removedMessages += 1;
+                }
+                logger.info(`Removed ${reactionRoleMessages.length} stale reaction role message(s) for unavailable guild ${targetGuildId}`);
+                continue;
+            }
+
+            for (const reactionRoleMessage of reactionRoleMessages) {
+                summary.scannedMessages += 1;
+
+                try {
+                    const channel = guild.channels.cache.get(reactionRoleMessage.channelId)
+                        || await guild.channels.fetch(reactionRoleMessage.channelId).catch(() => null);
+
+                    if (!channel || !channel.isTextBased?.()) {
+                        await client.db.delete(`reaction_roles:${targetGuildId}:${reactionRoleMessage.messageId}`);
+                        summary.removedMessages += 1;
+                        continue;
+                    }
+
+                    const message = await channel.messages.fetch(reactionRoleMessage.messageId).catch(() => null);
+                    if (!message) {
+                        await client.db.delete(`reaction_roles:${targetGuildId}:${reactionRoleMessage.messageId}`);
+                        summary.removedMessages += 1;
+                    }
+                } catch (messageCheckError) {
+                    summary.errors += 1;
+                    logger.warn(
+                        `Failed to validate reaction role message ${reactionRoleMessage.messageId} during reconciliation:`,
+                        messageCheckError
+                    );
+                }
+            }
+        }
+
+        logger.info(
+            `Reaction role reconciliation complete: scanned ${summary.scannedMessages} message(s) across ${summary.scannedGuilds} guild(s), removed ${summary.removedMessages}, errors ${summary.errors}`
+        );
+
+        return summary;
+    } catch (error) {
+        logger.error('Unexpected error during reaction role reconciliation:', error);
+        summary.errors += 1;
+        return summary;
+    }
+}
+
+
+
+
+##### FILE: src\services\serverstatsService.js
+import { logger } from '../utils/logger.js';
+import { logEvent, EVENT_TYPES } from './loggingService.js';
+
+export const COUNTER_TYPE_CONFIG = {
+  members: {
+    label: 'Members + Bots',
+    baseName: 'Members & Bots',
+    emoji: '👥'
+  },
+  members_only: {
+    label: 'Members Only',
+    baseName: 'Members',
+    emoji: '👤'
+  },
+  bots: {
+    label: 'Bots Only',
+    baseName: 'Bots',
+    emoji: '🤖'
+  }
+};
+
+function getCounterConfig(type) {
+  return COUNTER_TYPE_CONFIG[type] || {
+    label: 'Unknown',
+    baseName: 'Counter',
+    emoji: '❓'
+  };
+}
+
+export function getCounterTypeLabel(type) {
+  return getCounterConfig(type).label;
+}
+
+export function getCounterBaseName(type) {
+  return getCounterConfig(type).baseName;
+}
+
+export function getCounterEmoji(type) {
+  return getCounterConfig(type).emoji;
+}
+
+export async function getGuildCounterStats(guild) {
+  let memberCollection = guild.members.cache;
+
+  try {
+    memberCollection = await guild.members.fetch();
+  } catch (error) {
+    if (process.env.NODE_ENV !== 'production') {
+      logger.debug(`Failed to fetch all guild members for ${guild.id}, using cache only`, error);
+    }
+  }
+
+  const botCount = memberCollection.filter((member) => member.user.bot).size;
+  const totalCount = typeof guild.memberCount === 'number' ? guild.memberCount : memberCollection.size;
+  const humanCount = Math.max(totalCount - botCount, 0);
+
+  return {
+    totalCount,
+    botCount,
+    humanCount
+  };
+}
+
+export async function getCounterCount(guild, type) {
+  const stats = await getGuildCounterStats(guild);
+
+  switch (type) {
+    case 'members':
+      return stats.totalCount;
+    case 'bots':
+      return stats.botCount;
+    case 'members_only':
+      return stats.humanCount;
+    default:
+      return null;
+  }
+}
+
+
+function isValidCounterShape(counter) {
+  return Boolean(
+    counter &&
+    typeof counter === 'object' &&
+    typeof counter.id === 'string' &&
+    counter.id.length > 0 &&
+    typeof counter.type === 'string' &&
+    typeof counter.channelId === 'string' &&
+    counter.channelId.length > 0
+  );
+}
+
+function normalizeCounter(counter, guildId) {
+  const normalized = {
+    id: String(counter.id),
+    type: String(counter.type),
+    channelId: String(counter.channelId),
+    guildId: String(counter.guildId || guildId),
+    createdAt: counter.createdAt || new Date().toISOString(),
+    enabled: typeof counter.enabled === 'boolean' ? counter.enabled : true
+  };
+
+  if (counter.updatedAt) {
+    normalized.updatedAt = counter.updatedAt;
+  }
+
+  return normalized;
+}
+
+function sanitizeCounters(counters, guildId) {
+  if (!Array.isArray(counters)) {
+    return [];
+  }
+
+  return counters
+    .filter(isValidCounterShape)
+    .map(counter => normalizeCounter(counter, guildId));
+}
+
+
+
+
+
+
+
+
+export async function updateCounter(client, guild, counter) {
+  try {
+    if (!counter || !counter.type || !counter.channelId) {
+      logger.warn('Skipping invalid counter in updateCounter:', counter);
+      return false;
+    }
+    
+    const { type, channelId } = counter;
+    const channel = guild.channels.cache.get(channelId);
+    if (!channel) {
+      logger.error('Channel not found for counter:', channelId);
+      return false;
+    }
+
+    const count = await getCounterCount(guild, type);
+    if (count === null) {
+      logger.error('Unknown counter type:', type);
+      return false;
+    }
+
+    const baseName = getCounterBaseName(type);
+    if (process.env.NODE_ENV !== 'production') {
+      logger.debug(`Base name: "${baseName}", Current name: "${channel.name}"`);
+    }
+    
+    const newName = `${baseName}: ${count}`;
+    if (process.env.NODE_ENV !== 'production') {
+      logger.debug(`New name would be: "${newName}"`);
+    }
+    
+    if (channel.name !== newName) {
+      try {
+        await channel.setName(newName);
+        if (process.env.NODE_ENV !== 'production') {
+          logger.debug(`Updated channel name to: "${newName}"`);
+        }
+
+        
+        try {
+          await logEvent({
+            client,
+            guildId: guild.id,
+            eventType: EVENT_TYPES.COUNTER_UPDATE,
+            data: {
+              description: `Counter updated: ${baseName}`,
+              channelId: channel.id,
+              fields: [
+                {
+                  name: '📊 Counter Type',
+                  value: getCounterTypeLabel(type),
+                  inline: true
+                },
+                {
+                  name: '🔢 New Count',
+                  value: count.toString(),
+                  inline: true
+                },
+                {
+                  name: '📍 Channel',
+                  value: channel.toString(),
+                  inline: true
+                }
+              ]
+            }
+          });
+        } catch (error) {
+          logger.debug('Error logging counter update:', error);
+        }
+
+      } catch (error) {
+        logger.error(`Failed to update channel name for ${channel.id}:`, error);
+        return false;
+      }
+    } else {
+      if (process.env.NODE_ENV !== 'production') {
+        logger.debug('Channel name already correct, no update needed');
+      }
+    }
+    return true;
+  } catch (error) {
+    logger.error("Error updating counter:", error);
+    return false;
+  }
+}
+
+
+
+
+
+
+
+export async function getServerCounters(client, guildId) {
+  try {
+    if (!client || !client.db) {
+      logger.warn('Database not available for getServerCounters');
+      return [];
+    }
+    
+    const data = await client.db.get(`counters:${guildId}`);
+    
+    let counters = [];
+    
+    if (data && typeof data === 'object' && data.ok && Array.isArray(data.value)) {
+      counters = data.value;
+    } else if (Array.isArray(data)) {
+      counters = data;
+    } else if (typeof data === 'string') {
+      try {
+        const parsed = JSON.parse(data);
+        counters = Array.isArray(parsed) ? parsed : [];
+      } catch {
+        counters = [];
+      }
+    } else if (data && typeof data === 'object' && !data.ok && isValidCounterShape(data)) {
+      counters = [data];
+    } else {
+      if (process.env.NODE_ENV !== 'production') {
+        logger.debug('No counter data found, returning empty array');
+      }
+      return [];
+    }
+
+    return sanitizeCounters(counters, guildId);
+  } catch (error) {
+    logger.error("Error getting server counters:", error);
+    return [];
+  }
+}
+
+
+
+
+
+
+
+
+export async function saveServerCounters(client, guildId, counters) {
+  try {
+    if (!client || !client.db) {
+      logger.warn('Database not available for saveServerCounters');
+      return false;
+    }
+    
+    const sanitizedCounters = sanitizeCounters(counters, guildId);
+
+    if (process.env.NODE_ENV !== 'production') {
+      logger.debug(`Saving ${sanitizedCounters.length} counters for guild ${guildId}:`, sanitizedCounters);
+    }
+
+    await client.db.set(`counters:${guildId}`, sanitizedCounters);
+    if (process.env.NODE_ENV !== 'production') {
+      logger.debug('Counters saved successfully');
+    }
+    return true;
+  } catch (error) {
+    logger.error("Error saving server counters:", error);
+    return false;
+  }
+}
+
+
+
+
+##### FILE: src\services\shopService.js
+import { EmbedBuilder } from 'discord.js';
+import { shopConfig, shopItems, getItemById, validatePurchase, getCurrentPrice, getItemsInCategory } from '../config/shop/index.js';
+import { logger } from '../utils/logger.js';
+import { getEconomyData, setEconomyData } from '../utils/economy.js';
+
+
+
+
+class ShopService {
+    constructor() {
+        this.logger = logger.child({ module: 'ShopService' });
+    }
+
+    
+
+
+
+
+
+
+
+    async purchaseItem(userId, itemId, quantity = 1, options = {}) {
+        try {
+            const { guildId, client } = options;
+            
+            if (!client) {
+                throw new Error('Client is required for shop operations');
+            }
+            
+            const item = getItemById(itemId);
+            if (!item) {
+                return { success: false, message: 'Item not found in the shop.' };
+            }
+
+            const userData = await getEconomyData(client, guildId, userId);
+            
+            const totalCost = getCurrentPrice(itemId, { quantity, userData });
+            
+            if (userData.wallet < totalCost) {
+                const currency = this.getCurrencyInfo();
+                return { 
+                    success: false, 
+                    message: `You don't have enough ${currency.namePlural} to purchase this item.` 
+                };
+            }
+
+            const validation = validatePurchase(itemId, userData);
+            if (!validation.valid) {
+                return { success: false, message: validation.reason };
+            }
+
+            
+            userData.wallet -= totalCost;
+
+            
+            await this.addToUserInventory(userId, itemId, quantity, guildId, client, userData);
+
+            
+            await setEconomyData(client, guildId, userId, userData);
+
+            this.logger.info(`User ${userId} purchased ${quantity}x ${item.name} for ${totalCost} ${this.getCurrencyName()}`);
+
+            return {
+                success: true,
+                message: `Successfully purchased ${quantity}x ${item.name} for ${totalCost} ${this.getCurrencyName()}`,
+                data: {
+                    item,
+                    quantity,
+                    totalCost,
+                    remainingBalance: userData.wallet
+                }
+            };
+        } catch (error) {
+            this.logger.error(`Error purchasing item: ${error.message}`, { error, userId, itemId, quantity });
+            return { 
+                success: false, 
+                message: 'An error occurred while processing your purchase. Please try again later.' 
+            };
+        }
+    }
+
+    
+
+
+
+
+
+
+    async getUserInventory(userId, guildId, client) {
+        try {
+            const userData = await getEconomyData(client, guildId, userId);
+            return userData.inventory || {};
+        } catch (error) {
+            this.logger.error(`Error getting user inventory: ${error.message}`, { error, userId, guildId });
+            return {};
+        }
+    }
+
+    
+
+
+
+    async addToUserInventory(userId, itemId, quantity = 1, guildId = null, client = null, userData = null) {
+        try {
+            
+            if (!userData) {
+                userData = await getEconomyData(client, guildId, userId);
+            }
+            
+            if (!userData.inventory) {
+                userData.inventory = {};
+            }
+            
+            const item = getItemById(itemId);
+            
+            
+            if (item && item.type === 'upgrade') {
+                if (!userData.upgrades) {
+                    userData.upgrades = {};
+                }
+                userData.upgrades[itemId] = true;
+            } else {
+                
+                userData.inventory[itemId] = (userData.inventory[itemId] || 0) + quantity;
+            }
+            
+            this.logger.info(`Added ${quantity}x ${itemId} to user ${userId}'s inventory`);
+        } catch (error) {
+            this.logger.error(`Error adding item to inventory: ${error.message}`, { error, userId, itemId, quantity, guildId });
+            throw error;
+        }
+    }
+
+    
+
+
+
+    getCurrencyName() {
+        return shopConfig.currencyName || 'coins';
+    }
+
+    
+
+
+
+
+
+
+    createShopEmbed(options = {}) {
+        const { category, page = 1 } = options;
+        
+        const embed = new EmbedBuilder()
+            .setTitle('🛒 NH_starlightsecurity Shop')
+            .setColor('#5865F2')
+            .setDescription('Browse and purchase items from the shop. Use the buttons to navigate.')
+            .setFooter({ text: `Page ${page}` });
+
+        
+        return embed;
+    }
+
+    
+
+
+
+    getCategories() {
+        const categories = [
+            { 
+                id: 'all', 
+                name: 'All Items', 
+                emoji: '🛍️',
+                description: 'Browse all available items',
+                icon: '🛍️'
+            },
+            ...shopConfig.categories
+        ];
+        
+        return categories;
+    }
+    
+    
+
+
+
+    getCurrencyInfo() {
+        return {
+            name: shopConfig.currencyName,
+            namePlural: shopConfig.currencyNamePlural,
+            symbol: shopConfig.currencySymbol
+        };
+    }
+    
+    
+
+
+
+
+    getItemsForCategory(categoryId) {
+        if (categoryId === 'all') {
+            return shopItems;
+        }
+        return getItemsInCategory(categoryId);
+    }
+}
+
+const shopService = new ShopService();
+export default shopService;
+
+
+
+
+
+##### FILE: src\services\utilityService.js
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import { logger } from '../utils/logger.js';
+import { getFromDb, setInDb, deleteFromDb } from '../utils/database.js';
+import { createError, ErrorTypes } from '../utils/errorHandler.js';
+import { registerMemoryMap } from '../utils/cacheManager.js';
+import MemoryManager from '../utils/memoryManager.js';
+
+const REPORT_DUPLICATE_WINDOW = 60 * 60 * 1000; 
+const REPORT_USER_COOLDOWN = 10 * 60 * 1000; 
+
+
+const wipedataRequests = new Map();
+const WIPEDATA_COOLDOWN = 24 * 60 * 60 * 1000; 
+const WIPEDATA_CONFIRM_WINDOW = 2 * 60 * 1000; 
+const WIPEDATA_REQUEST_CACHE_LIMIT = 1000;
+
+// Register with global memory manager
+registerMemoryMap('Utility.wipedataRequests', wipedataRequests, WIPEDATA_CONFIRM_WINDOW);
+MemoryManager.getInstance().trackMap('Utility.wipedataRequests', wipedataRequests, { maxSize: WIPEDATA_REQUEST_CACHE_LIMIT, ttlMs: WIPEDATA_CONFIRM_WINDOW });
+
+
+const TODO_MAX_TASKS = 100;
+const TODO_MAX_LENGTH = 500;
+const SHARED_TODO_MAX_MEMBERS = 20;
+
+class UtilityService {
+
+    
+
+    
+
+
+
+
+
+
+    static async validateReport(reportedUserId, reportingUserId, reason) {
+        logger.debug(`[UTILITY_SERVICE] Validating report`, {
+            reportedUserId,
+            reportingUserId
+        });
+
+        
+        if (reportedUserId === reportingUserId) {
+            throw createError(
+                'Cannot report self',
+                ErrorTypes.VALIDATION,
+                'You cannot report yourself.',
+                { reportedUserId, reportingUserId }
+            );
+        }
+
+        
+        if (!reason || typeof reason !== 'string') {
+            throw createError(
+                'Invalid reason',
+                ErrorTypes.VALIDATION,
+                'Report reason must be a non-empty string.',
+                { provided: typeof reason }
+            );
+        }
+
+        const trimmedReason = reason.trim();
+        if (trimmedReason.length === 0) {
+            throw createError(
+                'Empty reason',
+                ErrorTypes.VALIDATION,
+                'Please provide a detailed reason for your report.',
+                { length: trimmedReason.length }
+            );
+        }
+
+        if (trimmedReason.length < 10) {
+            throw createError(
+                'Reason too short',
+                ErrorTypes.VALIDATION,
+                'Please be more detailed. Reason must be at least **10 characters**.',
+                { length: trimmedReason.length }
+            );
+        }
+
+        if (trimmedReason.length > 500) {
+            throw createError(
+                'Reason too long',
+                ErrorTypes.VALIDATION,
+                'Report reason cannot exceed **500 characters**.',
+                { length: trimmedReason.length }
+            );
+        }
+
+        return true;
+    }
+
+    
+
+
+
+
+
+
+    static async checkForDuplicateReport(guildId, reportedUserId, reportingUserId) {
+        logger.debug(`[UTILITY_SERVICE] Checking for duplicate reports`, {
+            guildId,
+            reportedUserId
+        });
+
+        const reportsKey = `reports:${guildId}:${reportedUserId}`;
+        const recentReportsList = await getFromDb(reportsKey, []);
+
+        const now = Date.now();
+        const recentWindow = recentReportsList.filter(
+            r => (now - r.timestamp) < REPORT_DUPLICATE_WINDOW
+        );
+
+        
+        const userReportCount = recentWindow.filter(
+            r => r.reportingUserId === reportingUserId
+        ).length;
+
+        if (userReportCount > 0) {
+            const lastReport = recentWindow
+                .filter(r => r.reportingUserId === reportingUserId)
+                .sort((a, b) => b.timestamp - a.timestamp)[0];
+
+            const timeSinceLast = now - lastReport.timestamp;
+            const timeRemaining = Math.ceil((REPORT_USER_COOLDOWN - timeSinceLast) / 1000 / 60);
+
+            logger.warn(`[UTILITY_SERVICE] User trying to report twice within cooldown`, {
+                guildId,
+                reportedUserId,
+                reportingUserId,
+                timeSinceLast
+            });
+
+            throw createError(
+                'Report cooldown active',
+                ErrorTypes.RATE_LIMIT,
+                `You can only report the same user once every **10 minutes**. Please wait **${timeRemaining}** more minutes.`,
+                { timeRemaining, cooldown: REPORT_USER_COOLDOWN }
+            );
+        }
+
+        return {
+            isDuplicate: false,
+            similarReportCount: recentWindow.length,
+            userHasReportedBefore: userReportCount > 0
+        };
+    }
+
+    
+
+
+
+
+
+
+
+
+    static async submitReport(client, guildId, reportedUserId, reportingUserId, reportData) {
+        logger.info(`[UTILITY_SERVICE] Submitting report`, {
+            guildId,
+            reportedUserId,
+            reportingUserId
+        });
+
+        
+        await this.validateReport(reportedUserId, reportingUserId, reportData.reason);
+
+        
+        await this.checkForDuplicateReport(guildId, reportedUserId, reportingUserId);
+
+        
+        const reportId = `${guildId}:${reportedUserId}:${Date.now()}`;
+        const report = {
+            id: reportId,
+            guildId,
+            reportedUserId,
+            reportingUserId,
+            reason: reportData.reason,
+            channel: reportData.channelId,
+            timestamp: new Date().toISOString(),
+            status: 'pending',
+            reviewed: false
+        };
+
+        
+        const reportsKey = `reports:${guildId}:${reportedUserId}`;
+        const recentReports = await getFromDb(reportsKey, []);
+        recentReports.push({
+            reportingUserId,
+            timestamp: Date.now(),
+            id: reportId
+        });
+        await setInDb(reportsKey, recentReports);
+
+        
+        await setInDb(`report:${reportId}`, report);
+
+        logger.info(`[UTILITY_SERVICE] Report submitted successfully`, {
+            guildId,
+            reportedUserId,
+            reportingUserId,
+            reportId,
+            timestamp: report.timestamp
+        });
+
+        return {
+            success: true,
+            reportId,
+            reportedUser: reportedUserId,
+            timestamp: report.timestamp
+        };
+    }
+
+    
+
+    
+
+
+
+
+
+    static async checkWipedataCooldown(guildId, userId) {
+        logger.debug(`[UTILITY_SERVICE] Checking wipedata cooldown`, {
+            guildId,
+            userId
+        });
+
+        const key = `wipedata:cooldown:${guildId}:${userId}`;
+        const lastWipe = await getFromDb(key, null);
+
+        if (!lastWipe) {
+            return { canWipe: true, cooldownRemaining: 0 };
+        }
+
+        const now = Date.now();
+        const timeSinceWipe = now - lastWipe;
+        const remaining = WIPEDATA_COOLDOWN - timeSinceWipe;
+
+        if (remaining > 0) {
+            logger.warn(`[UTILITY_SERVICE] User on wipedata cooldown`, {
+                guildId,
+                userId,
+                remaining
+            });
+
+            return {
+                canWipe: false,
+                cooldownRemaining: Math.ceil(remaining / 1000),
+                canWipeAt: new Date(now + remaining)
+            };
+        }
+
+        return { canWipe: true, cooldownRemaining: 0 };
+    }
+
+    
+
+
+
+
+
+
+    static async executeDataWipe(client, guildId, userId) {
+        logger.warn(`[UTILITY_SERVICE] Executing data wipe`, {
+            guildId,
+            userId,
+            timestamp: new Date().toISOString()
+        });
+
+        const now = Date.now();
+        const confirmationKey = `${guildId}:${userId}`;
+        const existingConfirmation = wipedataRequests.get(confirmationKey);
+
+        if (wipedataRequests.size > WIPEDATA_REQUEST_CACHE_LIMIT) {
+            for (const [key, value] of wipedataRequests.entries()) {
+                if (!value?.requestedAt || (now - value.requestedAt) > WIPEDATA_CONFIRM_WINDOW) {
+                    wipedataRequests.delete(key);
+                }
+            }
+        }
+
+        const hasValidConfirmation = existingConfirmation &&
+            (now - existingConfirmation.requestedAt) <= WIPEDATA_CONFIRM_WINDOW;
+
+        if (!hasValidConfirmation) {
+            wipedataRequests.set(confirmationKey, {
+                requestedAt: now,
+                expiresAt: now + WIPEDATA_CONFIRM_WINDOW
+            });
+
+            throw createError(
+                'Wipedata confirmation required',
+                ErrorTypes.VALIDATION,
+                'This action permanently deletes your stored data. Run the wipe command again within 2 minutes to confirm.',
+                {
+                    confirmationRequired: true,
+                    expiresAt: new Date(now + WIPEDATA_CONFIRM_WINDOW).toISOString()
+                }
+            );
+        }
+
+        wipedataRequests.delete(confirmationKey);
+
+        
+        const cooldown = await this.checkWipedataCooldown(guildId, userId);
+        if (!cooldown.canWipe) {
+            throw createError(
+                'Wipedata cooldown active',
+                ErrorTypes.RATE_LIMIT,
+                `You can only wipe your data once every **24 hours**. Please wait **${Math.ceil(cooldown.cooldownRemaining / 3600)}** hours.`,
+                { ...cooldown }
+            );
+        }
+
+        
+        const dataKeyPatterns = [
+            `economy:${guildId}:${userId}`,
+            `level:${guildId}:${userId}`,
+            `xp:${guildId}:${userId}`,
+            `inventory:${guildId}:${userId}`,
+            `bank:${guildId}:${userId}`,
+            `wallet:${guildId}:${userId}`,
+            `cooldowns:${guildId}:${userId}`,
+            `shop:${guildId}:${userId}`,
+            `shop_data:${guildId}:${userId}`,
+            `counter:${guildId}:${userId}`,
+            `birthday:${guildId}:${userId}`,
+            `balance:${guildId}:${userId}`,
+            `user:${guildId}:${userId}`,
+            `leveling:${guildId}:${userId}`,
+            `crimexp:${guildId}:${userId}`,
+            `robxp:${guildId}:${userId}`,
+            `crime_cooldown:${guildId}:${userId}`,
+            `rob_cooldown:${guildId}:${userId}`,
+            `lastDaily:${guildId}:${userId}`,
+            `lastWork:${guildId}:${userId}`,
+            `lastCrime:${guildId}:${userId}`,
+            `lastRob:${guildId}:${userId}`
+        ];
+
+        let deletedCount = 0;
+        const deletedKeys = [];
+        const deleteErrors = [];
+
+        
+        for (const key of dataKeyPatterns) {
+            try {
+                await deleteFromDb(key);
+                deletedCount++;
+                deletedKeys.push(key);
+            } catch (error) {
+                logger.error(`[UTILITY_SERVICE] Error deleting key during wipe`, error, { key });
+                deleteErrors.push({ key, error: error.message });
+            }
+        }
+
+        
+        try {
+            if (client.db?.list && typeof client.db.list === 'function') {
+                const userPrefix = `${guildId}:${userId}`;
+                const allKeys = await client.db.list(userPrefix);
+
+                if (Array.isArray(allKeys)) {
+                    for (const key of allKeys) {
+                        if (!dataKeyPatterns.includes(key)) {
+                            try {
+                                await deleteFromDb(key);
+                                deletedCount++;
+                                deletedKeys.push(key);
+                            } catch (error) {
+                                logger.error(`[UTILITY_SERVICE] Error deleting prefix key`, error, { key });
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            logger.warn(`[UTILITY_SERVICE] Could not perform prefix search`, error);
+        }
+
+        
+        const cooldownKey = `wipedata:cooldown:${guildId}:${userId}`;
+        await setInDb(cooldownKey, Date.now());
+
+        
+        const auditKey = `wipedata:audit:${guildId}:${userId}:${Date.now()}`;
+        await setInDb(auditKey, {
+            userId,
+            guildId,
+            timestamp: new Date().toISOString(),
+            deletedCount,
+            deletedKeys,
+            errors: deleteErrors
+        });
+
+        logger.warn(`[UTILITY_SERVICE] Data wipe completed`, {
+            guildId,
+            userId,
+            deletedCount,
+            errorCount: deleteErrors.length,
+            timestamp: new Date().toISOString()
+        });
+
+        return {
+            success: true,
+            deletedCount,
+            timestamp: new Date().toISOString(),
+            nextWipeAvailable: new Date(Date.now() + WIPEDATA_COOLDOWN)
+        };
+    }
+
+    
+
+    
+
+
+
+
+
+    static async addTodoTask(userId, taskContent) {
+        logger.debug(`[UTILITY_SERVICE] Adding todo task`, { userId, taskLength: taskContent?.length });
+
+        if (!taskContent || typeof taskContent !== 'string') {
+            throw createError(
+                'Invalid task',
+                ErrorTypes.VALIDATION,
+                'Task must be a non-empty string.',
+                { provided: typeof taskContent }
+            );
+        }
+
+        const trimmed = taskContent.trim();
+        if (trimmed.length === 0) {
+            throw createError(
+                'Empty task',
+                ErrorTypes.VALIDATION,
+                'Please provide a task description.',
+                { length: trimmed.length }
+            );
+        }
+
+        if (trimmed.length > TODO_MAX_LENGTH) {
+            throw createError(
+                'Task too long',
+                ErrorTypes.VALIDATION,
+                `Task cannot exceed **${TODO_MAX_LENGTH}** characters.`,
+                { length: trimmed.length, max: TODO_MAX_LENGTH }
+            );
+        }
+
+        
+        const todoKey = `todo:${userId}`;
+        const todoList = await getFromDb(todoKey, { tasks: [], nextId: 1 });
+
+        
+        if (todoList.tasks?.length >= TODO_MAX_TASKS) {
+            throw createError(
+                'Too many tasks',
+                ErrorTypes.VALIDATION,
+                `You cannot have more than **${TODO_MAX_TASKS}** tasks.`,
+                { current: todoList.tasks.length, max: TODO_MAX_TASKS }
+            );
+        }
+
+        
+        const taskId = todoList.nextId || 1;
+        const task = {
+            id: taskId,
+            content: trimmed,
+            completed: false,
+            createdAt: new Date().toISOString()
+        };
+
+        
+        if (!Array.isArray(todoList.tasks)) {
+            todoList.tasks = [];
+        }
+        todoList.tasks.push(task);
+        todoList.nextId = (todoList.nextId || 1) + 1;
+
+        
+        await setInDb(todoKey, todoList);
+
+        logger.info(`[UTILITY_SERVICE] Todo task added`, {
+            userId,
+            taskId,
+            taskLength: trimmed.length
+        });
+
+        return task;
+    }
+
+    
+
+
+
+
+
+    static async completeTodoTask(userId, taskId) {
+        logger.debug(`[UTILITY_SERVICE] Completing todo task`, { userId, taskId });
+
+        const todoKey = `todo:${userId}`;
+        const todoList = await getFromDb(todoKey, { tasks: [] });
+
+        const task = todoList.tasks?.find(t => t.id === taskId);
+        if (!task) {
+            throw createError(
+                'Task not found',
+                ErrorTypes.VALIDATION,
+                'The task does not exist.',
+                { taskId, userId }
+            );
+        }
+
+        task.completed = true;
+        task.completedAt = new Date().toISOString();
+
+        await setInDb(todoKey, todoList);
+
+        logger.info(`[UTILITY_SERVICE] Todo task completed`, {
+            userId,
+            taskId,
+            completedAt: task.completedAt
+        });
+
+        return task;
+    }
+
+    
+
+
+
+
+
+    static async removeTodoTask(userId, taskId) {
+        logger.debug(`[UTILITY_SERVICE] Removing todo task`, { userId, taskId });
+
+        const todoKey = `todo:${userId}`;
+        const todoList = await getFromDb(todoKey, { tasks: [] });
+
+        const initialLength = todoList.tasks?.length || 0;
+        todoList.tasks = todoList.tasks?.filter(t => t.id !== taskId) || [];
+
+        if (todoList.tasks.length === initialLength) {
+            throw createError(
+                'Task not found',
+                ErrorTypes.VALIDATION,
+                'The task does not exist.',
+                { taskId, userId }
+            );
+        }
+
+        await setInDb(todoKey, todoList);
+
+        logger.info(`[UTILITY_SERVICE] Todo task removed`, {
+            userId,
+            taskId,
+            remainingTasks: todoList.tasks.length
+        });
+
+        return {
+            success: true,
+            taskId,
+            remainingTasks: todoList.tasks.length
+        };
+    }
+
+    
+
+
+
+
+    static async getTodoList(userId) {
+        logger.debug(`[UTILITY_SERVICE] Fetching todo list`, { userId });
+
+        const todoKey = `todo:${userId}`;
+        const todoList = await getFromDb(todoKey, { tasks: [] });
+
+        return {
+            userId,
+            totalTasks: todoList.tasks?.length || 0,
+            completedTasks: todoList.tasks?.filter(t => t.completed).length || 0,
+            pendingTasks: todoList.tasks?.filter(t => !t.completed).length || 0,
+            tasks: todoList.tasks || []
+        };
+    }
+
+    
+
+
+
+
+
+
+    static async createSharedTodoList(userId, listName, listId) {
+        logger.info(`[UTILITY_SERVICE] Creating shared todo list`, {
+            userId,
+            listName,
+            listId
+        });
+
+        if (!listName || listName.trim().length === 0) {
+            throw createError(
+                'Invalid list name',
+                ErrorTypes.VALIDATION,
+                'List name cannot be empty.',
+                { listName }
+            );
+        }
+
+        const sharedList = {
+            id: listId,
+            name: listName.trim(),
+            creatorId: userId,
+            members: [userId],
+            tasks: [],
+            nextId: 1,
+            createdAt: new Date().toISOString()
+        };
+
+        const listKey = `shared_todo:${listId}`;
+        await setInDb(listKey, sharedList);
+
+        
+        const userListsKey = `user_shared_lists:${userId}`;
+        const userLists = await getFromDb(userListsKey, []);
+        if (!userLists.includes(listId)) {
+            userLists.push(listId);
+            await setInDb(userListsKey, userLists);
+        }
+
+        logger.info(`[UTILITY_SERVICE] Shared todo list created`, {
+            userId,
+            listId,
+            listName: listName.trim()
+        });
+
+        return sharedList;
+    }
+
+    
+
+
+
+
+
+
+    static async addMemberToSharedList(listId, memberId, requestedBy) {
+        logger.info(`[UTILITY_SERVICE] Adding member to shared list`, {
+            listId,
+            memberId,
+            requestedBy
+        });
+
+        const listKey = `shared_todo:${listId}`;
+        const list = await getFromDb(listKey, null);
+
+        if (!list) {
+            throw createError(
+                'List not found',
+                ErrorTypes.VALIDATION,
+                'The shared list does not exist.',
+                { listId }
+            );
+        }
+
+        
+        if (list.creatorId !== requestedBy) {
+            throw createError(
+                'Permission denied',
+                ErrorTypes.VALIDATION,
+                'Only the list creator can add members.',
+                { listId, creatorId: list.creatorId }
+            );
+        }
+
+        
+        if (list.members?.length >= SHARED_TODO_MAX_MEMBERS) {
+            throw createError(
+                'Too many members',
+                ErrorTypes.VALIDATION,
+                `Shared lists can have a maximum of **${SHARED_TODO_MAX_MEMBERS}** members.`,
+                { current: list.members.length, max: SHARED_TODO_MAX_MEMBERS }
+            );
+        }
+
+        
+        if (!list.members) list.members = [];
+        if (!list.members.includes(memberId)) {
+            list.members.push(memberId);
+        }
+
+        await setInDb(listKey, list);
+
+        
+        const memberListsKey = `user_shared_lists:${memberId}`;
+        const memberLists = await getFromDb(memberListsKey, []);
+        if (!memberLists.includes(listId)) {
+            memberLists.push(listId);
+            await setInDb(memberListsKey, memberLists);
+        }
+
+        logger.info(`[UTILITY_SERVICE] Member added to shared list`, {
+            listId,
+            memberId,
+            totalMembers: list.members.length
+        });
+
+        return {
+            success: true,
+            listId,
+            memberId,
+            totalMembers: list.members.length
+        };
+    }
+}
+
+export default UtilityService;
+
+
 ##### FILE: src\services\voiceService.js
 
 
@@ -22,10 +3796,16 @@
 import { logger } from '../utils/logger.js';
 import { createError, ErrorTypes } from '../utils/errorHandler.js';
 import { PermissionFlagsBits } from 'discord.js';
+import { registerMemoryMap } from '../utils/cacheManager.js';
+import MemoryManager from '../utils/memoryManager.js';
 
 
 const inviteCreationLimits = new Map();
-const INVITE_CREATION_COOLDOWN = 5 * 1000; 
+const INVITE_CREATION_COOLDOWN = 5 * 1000;
+
+// Register with global memory manager
+registerMemoryMap('Voice.inviteLimits', inviteCreationLimits, 60000);
+MemoryManager.getInstance().trackMap('Voice.inviteLimits', inviteCreationLimits, { maxSize: 5000, ttlMs: 60000 });
 
 
 const ACTIVITIES = {
@@ -481,177 +4261,6 @@ class VoiceService {
 export default VoiceService;
 
 
-##### FILE: src\services\warningService.js
-import { getFromDb, setInDb } from '../utils/database.js';
-import { logger } from '../utils/logger.js';
-
-
-
-
-
-export class WarningService {
-  
-
-
-
-
-  static async addWarning({
-    guildId,
-    userId,
-    moderatorId,
-    reason,
-    timestamp = Date.now()
-  }) {
-    try {
-      const key = `moderation:warnings:${guildId}:${userId}`;
-      
-      
-      const warnings = await getFromDb(key, []);
-      
-      
-      if (!Array.isArray(warnings)) {
-        logger.warn(`Warnings for ${userId} in ${guildId} corrupted, resetting`);
-        await setInDb(key, []);
-        return { success: false, error: 'Corrupted data' };
-      }
-
-      
-      const warning = {
-        id: Date.now(),
-        guildId,
-        userId,
-        moderatorId,
-        reason,
-        timestamp,
-        status: 'active'
-      };
-
-      
-      warnings.push(warning);
-
-      
-      await setInDb(key, warnings);
-
-      logger.info(`Warning added: ${userId} in ${guildId} by ${moderatorId}`);
-      
-      return {
-        success: true,
-        id: warning.id,
-        totalCount: warnings.length
-      };
-    } catch (error) {
-      logger.error('Error adding warning:', error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  
-
-
-
-
-
-  static async getWarnings(guildId, userId) {
-    try {
-      const key = `moderation:warnings:${guildId}:${userId}`;
-      const warnings = await getFromDb(key, []);
-      
-      // Filter out deleted warnings and validate schema
-      return Array.isArray(warnings) 
-        ? warnings.filter(w => w && w.status !== 'deleted')
-        : [];
-    } catch (error) {
-      logger.error('Error fetching warnings:', error);
-      return [];
-    }
-  }
-
-  
-
-
-
-
-
-  static async getWarningCount(guildId, userId) {
-    const warnings = await this.getWarnings(guildId, userId);
-    return warnings.length;
-  }
-
-  
-
-
-
-
-
-
-  static async removeWarning(guildId, userId, warningId) {
-    try {
-      const key = `moderation:warnings:${guildId}:${userId}`;
-      const warnings = await getFromDb(key, []);
-      
-      const index = warnings.findIndex(w => w.id === warningId);
-      if (index === -1) {
-        return { success: false, error: 'Warning not found' };
-      }
-
-      warnings[index].status = 'deleted';
-      await setInDb(key, warnings);
-
-      logger.info(`Warning removed: ${warningId} for ${userId} in ${guildId}`);
-      return { success: true };
-    } catch (error) {
-      logger.error('Error removing warning:', error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  
-
-
-
-
-
-  static async clearWarnings(guildId, userId) {
-    try {
-      const key = `moderation:warnings:${guildId}:${userId}`;
-      const warnings = await getFromDb(key, []);
-      const count = warnings.length;
-
-      await setInDb(key, []);
-
-      logger.info(`Warnings cleared for ${userId} in ${guildId} (${count} removed)`);
-      return { success: true, count };
-    } catch (error) {
-      logger.error('Error clearing warnings:', error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  
-
-
-
-
-
-  static async getGuildWarnings(guildId, filters = {}) {
-    try {
-      const { moderatorId, limit = 100 } = filters;
-      const prefix = `moderation:warnings:${guildId}:`;
-      
-      // This implementation assumes database has list() method
-      
-      const allWarnings = [];
-      
-      logger.debug(`Fetched guild warnings for ${guildId} with ${allWarnings.length} total`);
-      return allWarnings.slice(0, limit);
-    } catch (error) {
-      logger.error('Error fetching guild warnings:', error);
-      return [];
-    }
-  }
-}
-
-
 ##### FILE: src\services\welcomeService.js
 
 
@@ -676,10 +4285,16 @@ import { logger } from '../utils/logger.js';
 import { getWelcomeConfig, updateWelcomeConfig } from '../utils/database.js';
 import { formatWelcomeMessage } from '../utils/welcome.js';
 import { createError, ErrorTypes } from '../utils/errorHandler.js';
+import { registerMemoryMap } from '../utils/cacheManager.js';
+import MemoryManager from '../utils/memoryManager.js';
 
 
 const autoRoleUpdateLimits = new Map();
-const AUTOROLE_UPDATE_COOLDOWN = 5 * 60 * 1000; 
+const AUTOROLE_UPDATE_COOLDOWN = 5 * 60 * 1000;
+
+// Register with global memory manager
+registerMemoryMap('Welcome.autoRoleLimits', autoRoleUpdateLimits, AUTOROLE_UPDATE_COOLDOWN);
+MemoryManager.getInstance().trackMap('Welcome.autoRoleLimits', autoRoleUpdateLimits, { maxSize: 5000, ttlMs: AUTOROLE_UPDATE_COOLDOWN });
 
 class WelcomeService {
     
@@ -3013,396 +6628,6 @@ export function formatProgressBar(current, max, size = 10) {
 
 
 
-##### FILE: src\utils\errorHandler.js
-/**
- * Centralized Error Handling System
- * 
- * This module provides structured error handling for the NH_starlightsecurity application.
- * 
- * PHILOSOPHY:
- * - All errors are categorized by type for consistent handling
- * - User-facing errors display friendly messages
- * - System errors are logged with full context
- * - Errors contain context information for debugging
- * 
- * USAGE:
- * - Throw StarlightError for application-specific errors
- * - Use handleInteractionError for interaction errors
- * - Errors are automatically formatted and sent to user
- * 
- * ERROR TYPES:
- * - VALIDATION: Invalid user input
- * - PERMISSION: Missing access permissions
- * - CONFIGURATION: Missing/invalid configuration
- * - DATABASE: Database operation failure
- * - NETWORK: Network/external service failure
- * - DISCORD_API: Discord API error
- * - USER_INPUT: User input processing error
- * - RATE_LIMIT: Rate limit exceeded
- * - UNKNOWN: Unclassified error
- */
-
-import { logger } from './logger.js';
-import { createEmbed } from './embeds.js';
-import { MessageFlags } from 'discord.js';
-import { getErrorMetadata, getDefaultErrorCodeByType, resolveErrorCode, ErrorCodes } from './errorRegistry.js';
-
-
-
-
-export const ErrorTypes = {
-    VALIDATION: 'validation',
-    PERMISSION: 'permission',
-    CONFIGURATION: 'configuration',
-    DATABASE: 'database',
-    NETWORK: 'network',
-    DISCORD_API: 'discord_api',
-    USER_INPUT: 'user_input',
-    RATE_LIMIT: 'rate_limit',
-    UNKNOWN: 'unknown'
-};
-
-
-
-
-export class StarlightError extends Error {
-    constructor(message, type = ErrorTypes.UNKNOWN, userMessage = null, context = {}) {
-        super(message);
-        this.name = 'StarlightError';
-        this.type = type;
-        this.userMessage = userMessage;
-        this.context = context;
-        this.code = context?.errorCode || getDefaultErrorCodeByType(type);
-        this.timestamp = new Date().toISOString();
-    }
-}
-
-
-
-
-export function categorizeError(error) {
-    if (error instanceof StarlightError) {
-        return error.type;
-    }
-
-    const message = error.message?.toLowerCase() || '';
-    const code = error.code;
-
-    if (code >= 10000 && code < 20000) {
-        return ErrorTypes.DISCORD_API;
-    }
-
-    if (message.includes('rate limit') || code === 50001) {
-        return ErrorTypes.RATE_LIMIT;
-    }
-
-    if (message.includes('permission') || message.includes('missing') || code === 50013) {
-        return ErrorTypes.PERMISSION;
-    }
-
-    if (message.includes('database') || message.includes('connection') || message.includes('timeout')) {
-        return ErrorTypes.DATABASE;
-    }
-
-    if (message.includes('network') || message.includes('fetch') || message.includes('enotconn')) {
-        return ErrorTypes.NETWORK;
-    }
-
-    if (message.includes('config') || message.includes('not found') || message.includes('invalid')) {
-        return ErrorTypes.CONFIGURATION;
-    }
-
-    if (message.includes('validation') || message.includes('invalid') || message.includes('required')) {
-        return ErrorTypes.VALIDATION;
-    }
-
-    return ErrorTypes.UNKNOWN;
-}
-
-
-
-
-const UserMessages = {
-    [ErrorTypes.VALIDATION]: {
-        default: "Please check your input and try again.",
-        missing_required: "You're missing some required information. Please check the command options.",
-        invalid_format: "The format you provided is incorrect. Please try again."
-    },
-    [ErrorTypes.PERMISSION]: {
-        default: "I don't have permission to do that. Please check my server permissions.",
-        user_permission: "You don't have permission to use this command.",
-        bot_permission: "I need additional permissions to perform this action."
-    },
-    [ErrorTypes.CONFIGURATION]: {
-        default: "Something is not configured correctly. Please contact an administrator.",
-        missing_config: "This feature hasn't been set up yet. Please contact an administrator.",
-        invalid_config: "The configuration is invalid. Please contact an administrator."
-    },
-    [ErrorTypes.DATABASE]: {
-        default: "I'm having trouble with my database. Please try again in a moment.",
-        connection_failed: "I'm having trouble connecting to my database. Please try again later.",
-        timeout: "The operation took too long. Please try again."
-    },
-    [ErrorTypes.NETWORK]: {
-        default: "I'm having network issues. Please try again in a moment.",
-        timeout: "The request timed out. Please try again.",
-        unreachable: "I can't reach the service right now. Please try again later."
-    },
-    [ErrorTypes.DISCORD_API]: {
-        default: "I'm having trouble with Discord. Please try again in a moment.",
-        rate_limit: "You're doing that too much. Please wait a moment and try again.",
-        forbidden: "I'm not allowed to do that. Please check my permissions."
-    },
-    [ErrorTypes.USER_INPUT]: {
-        default: "There was an issue with your request. Please try again.",
-        invalid_user: "I couldn't find that user. Please check the user mention or ID.",
-        invalid_channel: "I couldn't find that channel. Please check the channel mention or ID."
-    },
-    [ErrorTypes.RATE_LIMIT]: {
-        default: "You're doing that too much. Please wait a moment and try again.",
-        command_cooldown: "This command is on cooldown. Please wait before using it again.",
-        global_rate_limit: "You're being rate limited by Discord. Please wait a moment."
-    },
-    [ErrorTypes.UNKNOWN]: {
-        default: "Something went wrong. Please try again in a moment.",
-        unexpected: "An unexpected error occurred. Please try again later."
-    }
-};
-
-
-
-
-export function getUserMessage(error, context = {}) {
-    const type = categorizeError(error);
-    const messages = UserMessages[type] || UserMessages[ErrorTypes.UNKNOWN];
-    
-    if (error.userMessage) {
-        return error.userMessage;
-    }
-
-    if (context.subtype && messages[context.subtype]) {
-        return messages[context.subtype];
-    }
-
-    return messages.default;
-}
-
-
-
-
-export async function handleInteractionError(interaction, error, context = {}) {
-    const errorType = categorizeError(error);
-    const userMessage = getUserMessage(error, context);
-    const resolvedErrorCode = resolveErrorCode({ error, errorType, context });
-    const errorMetadata = getErrorMetadata(resolvedErrorCode);
-    const traceId = context.traceId || interaction?.traceContext?.traceId || interaction?.traceId || error?.context?.traceId;
-    
-    
-    
-    
-    const isUserError = [
-        ErrorTypes.VALIDATION,
-        ErrorTypes.RATE_LIMIT,
-        ErrorTypes.USER_INPUT,
-        ErrorTypes.PERMISSION
-    ].includes(errorType);
-    const isExpectedError = Boolean(error?.context?.expected === true || error?.context?.suppressErrorLog === true);
-    
-    const logData = {
-        event: 'interaction.error',
-        errorCode: resolvedErrorCode,
-        remediationHint: errorMetadata.remediation,
-        severity: errorMetadata.severity,
-        retryable: errorMetadata.retryable,
-        error: error.message,
-        type: errorType,
-        traceId,
-        guildId: interaction.guildId,
-        userId: interaction.user.id,
-        command: interaction.commandName || context.command,
-        interaction: {
-            type: interaction.type,
-            commandName: interaction.commandName,
-            customId: interaction.customId,
-            userId: interaction.user.id,
-            guildId: interaction.guildId,
-            channelId: interaction.channelId
-        },
-        context
-    };
-    
-    if (isUserError || isExpectedError) {
-        if (errorType !== ErrorTypes.RATE_LIMIT) {
-            logger.debug(`User Error [${errorType.toUpperCase()}]: ${error.message}`, logData);
-        }
-    } else {
-        // System errors (database, network, etc.) - unexpected failures
-        logger.error(`System Error [${errorType.toUpperCase()}]`, {
-            ...logData,
-            stack: error.stack
-        });
-    }
-
-    const embed = createEmbed({
-        title: getErrorTitle(errorType),
-        description: userMessage,
-        color: 'error',
-        timestamp: true
-    });
-
-    if (errorType === ErrorTypes.RATE_LIMIT) {
-        embed.addFields({
-            name: "💡 Tip",
-            value: "Rate limits help prevent spam. Wait a moment before trying again."
-        });
-    } else if (errorType === ErrorTypes.PERMISSION) {
-        embed.addFields({
-            name: "🔧 Need Help?",
-            value: "Contact a server administrator if you believe this is an error."
-        });
-    } else if (errorType === ErrorTypes.CONFIGURATION) {
-        embed.addFields({
-            name: "📋 Configuration",
-            value: "This feature needs to be configured by a server administrator."
-        });
-    }
-
-    try {
-        
-        if (!interaction || !interaction.id) {
-            logger.warn('Interaction was null or invalid when handling error', {
-                event: 'interaction.error.invalid_interaction',
-                errorCode: ErrorCodes.INTERACTION_INVALID,
-                remediationHint: getErrorMetadata(ErrorCodes.INTERACTION_INVALID).remediation,
-                traceId
-            });
-            return;
-        }
-
-        
-        if (interaction.createdTimestamp && (Date.now() - interaction.createdTimestamp) > 14 * 60 * 1000) {
-            logger.warn('Interaction expired before error handler could send response', {
-                event: 'interaction.error.expired',
-                errorCode: ErrorCodes.INTERACTION_EXPIRED,
-                remediationHint: getErrorMetadata(ErrorCodes.INTERACTION_EXPIRED).remediation,
-                traceId,
-                guildId: interaction.guildId,
-                userId: interaction.user.id,
-                command: interaction.commandName || context.command
-            });
-            return;
-        }
-
-        const errorMessage = { 
-            embeds: [embed]
-        };
-        
-        if (!interaction.deferred && !interaction.replied) {
-            errorMessage.flags = MessageFlags.Ephemeral;
-        }
-        
-        if (interaction.deferred || interaction.replied) {
-            await interaction.editReply(errorMessage);
-        } else {
-            await interaction.reply(errorMessage);
-        }
-    } catch (replyError) {
-        
-        if (replyError.code === 40060 || replyError.code === 10062) {
-            logger.warn('Interaction already acknowledged or expired, cannot send error response:', {
-                event: 'interaction.error.response_unavailable',
-                errorCode: String(replyError.code),
-                traceId,
-                guildId: interaction.guildId,
-                userId: interaction.user.id,
-                command: interaction.commandName || context.command,
-                code: replyError.code
-            });
-            return;
-        }
-        logger.error('Failed to send error response:', {
-            event: 'interaction.error.response_failed',
-            errorCode: String(replyError.code || ErrorCodes.INTERACTION_RESPONSE_FAILED),
-            remediationHint: getErrorMetadata(ErrorCodes.INTERACTION_RESPONSE_FAILED).remediation,
-            traceId,
-            guildId: interaction.guildId,
-            userId: interaction.user.id,
-            command: interaction.commandName || context.command,
-            error: replyError
-        });
-    }
-}
-
-
-
-
-function getErrorTitle(errorType) {
-    const titles = {
-        [ErrorTypes.VALIDATION]: "❌ Invalid Input",
-        [ErrorTypes.PERMISSION]: "🚫 Permission Denied",
-        [ErrorTypes.CONFIGURATION]: "⚙️ Configuration Error",
-        [ErrorTypes.DATABASE]: "🗄️ Database Error",
-        [ErrorTypes.NETWORK]: "🌐 Network Error",
-        [ErrorTypes.DISCORD_API]: "🔌 API Error",
-        [ErrorTypes.USER_INPUT]: "💬 Input Error",
-        [ErrorTypes.RATE_LIMIT]: "⏱️ Slow Down!",
-        [ErrorTypes.UNKNOWN]: "❓ Unexpected Error"
-    };
-    
-    return titles[errorType] || titles[ErrorTypes.UNKNOWN];
-}
-
-
-
-
-export function withErrorHandling(fn, context = {}) {
-    return async (...args) => {
-        try {
-            return await fn(...args);
-        } catch (error) {
-            const interaction = args.find(arg => 
-                arg && typeof arg === 'object' && 
-                (arg.isCommand || arg.isButton || arg.isModalSubmit || arg.isStringSelectMenu || arg.isChatInputCommand)
-            );
-            
-            if (interaction) {
-                await handleInteractionError(interaction, error, context);
-            } else {
-                logger.error('Error in non-interaction context:', error);
-            }
-            
-            return null;
-        }
-    };
-}
-
-
-
-
-export function createError(message, type = ErrorTypes.UNKNOWN, userMessage = null, context = {}) {
-    const normalizedContext = {
-        ...context,
-        errorCode: context?.errorCode || getDefaultErrorCodeByType(type)
-    };
-
-    return new StarlightError(message, type, userMessage, normalizedContext);
-}
-
-export default {
-    ErrorTypes,
-    StarlightError,
-    categorizeError,
-    getUserMessage,
-    handleInteractionError,
-    withErrorHandling,
-    createError
-};
-
-
-
-
-
-
 ##### FILE: src\utils\errorRegistry.js
 const ErrorCodes = Object.freeze({
   VALIDATION_FAILED: 'VALIDATION_FAILED',
@@ -5090,109 +8315,6 @@ export function parseEventTypeFromButton(customId) {
 }
 
 
-##### FILE: src\utils\memoryStorage.js
-import { logger } from './logger.js';
-
-/**
- * In-memory storage fallback for when database is unavailable
- * Used when PostgreSQL connection fails
- */
-class MemoryStorage {
-    constructor() {
-        this.data = new Map();
-        this.expirationTimes = new Map();
-    }
-
-    async get(key, defaultValue = null) {
-        const value = this.data.get(key);
-        
-        if (this.expirationTimes.has(key)) {
-            const expirationTime = this.expirationTimes.get(key);
-            if (Date.now() > expirationTime) {
-                this.data.delete(key);
-                this.expirationTimes.delete(key);
-                return defaultValue;
-            }
-        }
-        
-        return value !== undefined ? value : defaultValue;
-    }
-
-    async set(key, value, ttl = null) {
-        this.data.set(key, value);
-        
-        if (ttl && ttl > 0) {
-            this.expirationTimes.set(key, Date.now() + (ttl * 1000));
-        }
-        
-        return true;
-    }
-
-    async delete(key) {
-        this.data.delete(key);
-        this.expirationTimes.delete(key);
-        return true;
-    }
-
-    async list(prefix) {
-        const keys = [];
-        for (const [key] of this.data.keys()) {
-            if (key.startsWith(prefix)) {
-                if (this.expirationTimes.has(key)) {
-                    const expirationTime = this.expirationTimes.get(key);
-                    if (Date.now() > expirationTime) {
-                        this.data.delete(key);
-                        this.expirationTimes.delete(key);
-                        continue;
-                    }
-                }
-                keys.push(key);
-            }
-        }
-        return keys;
-    }
-
-    async exists(key) {
-        const value = this.data.get(key);
-        
-        if (this.expirationTimes.has(key)) {
-            const expirationTime = this.expirationTimes.get(key);
-            if (Date.now() > expirationTime) {
-                this.data.delete(key);
-                this.expirationTimes.delete(key);
-                return false;
-            }
-        }
-        
-        return value !== undefined;
-    }
-
-    async increment(key, amount = 1) {
-        const current = await this.get(key, 0);
-        const newValue = current + amount;
-        await this.set(key, newValue);
-        return newValue;
-    }
-
-    async decrement(key, amount = 1) {
-        const current = await this.get(key, 0);
-        const newValue = current - amount;
-        await this.set(key, newValue);
-        return newValue;
-    }
-
-    async clear() {
-        this.data.clear();
-        this.expirationTimes.clear();
-        return true;
-    }
-}
-
-export { MemoryStorage };
-
-
-
-
 ##### FILE: src\utils\messageTemplates.js
 import { EmbedBuilder } from 'discord.js';
 import { getColor } from '../config/bot.js';
@@ -5268,243 +8390,6 @@ export const ContextualMessages = {
 export default MessageTemplates;
 
 
-
-
-
-##### FILE: src\utils\moderation.js
-import { EmbedBuilder } from 'discord.js';
-import { getGuildConfig } from '../services/guildConfig.js';
-import { logger } from './logger.js';
-import { getFromDb, setInDb } from './database.js';
-import { getColor } from '../config/bot.js';
-
-export async function logEvent({ client, guild, guildId, event }) {
-  try {
-    if (!guild && guildId) {
-      guild = client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
-    }
-    if (!guild) {
-      logger.warn('logEvent invoked without valid guild or guildId');
-      return;
-    }
-    const config = await getGuildConfig(client, guild.id);
-    const loggingDisabled = config?.logging?.enabled === false || config?.enableLogging === false;
-    const logChannelId = config?.logging?.channelId || config?.logChannelId;
-    if (!logChannelId || loggingDisabled) {
-      logger.debug(`Logging disabled or no log channel configured for guild ${guild.id}`);
-      return;
-    }
-
-    const ignoredUsers = config.logIgnore?.users || [];
-    if (event.metadata?.userId && ignoredUsers.includes(event.metadata.userId)) {
-      return;
-    }
-
-    const logChannel = guild.channels.cache.get(logChannelId);
-    if (!logChannel) {
-      logger.warn(`Log channel ${logChannelId} not found in guild ${guild.id}`);
-      return;
-    }
-
-    const actionStyles = {
-      'Member Banned': { color: getColor('error'), icon: '🔨' },
-      'Member Kicked': { color: getColor('warning'), icon: '👢' },
-      'Member Timed Out': { color: getColor('warning'), icon: '⏳' },
-      'Member Untimeouted': { color: getColor('success'), icon: '✅' },
-      'User Warned': { color: getColor('warning'), icon: '⚠️' },
-      'Warnings Viewed': { color: getColor('info'), icon: '👁️' },
-      'Messages Purged': { color: getColor('moderation'), icon: '🗑️' },
-      'Channel Locked': { color: getColor('moderation'), icon: '🔒' },
-      'Channel Unlocked': { color: getColor('success'), icon: '🔓' },
-      'Case Created': { color: getColor('info'), icon: '📋' },
-      'Case Updated': { color: getColor('moderation'), icon: '📝' },
-      'DM Sent': { color: getColor('info'), icon: '✉️' },
-      'Log Channel Activated': { color: getColor('success'), icon: '📝' }
-    };
-
-    const style = actionStyles[event.action] || { color: getColor('primary'), icon: '🔨' };
-
-    const embed = new EmbedBuilder()
-      .setColor(event.color || style.color)
-      .setTitle(`${style.icon} ${event.action}`)
-      .addFields(
-        { name: "Target", value: event.target, inline: true },
-        { name: "Moderator", value: event.executor, inline: true }
-      )
-      .setTimestamp()
-      .setFooter({ 
-        text: `Guild ID: ${guild.id} | Moderator ID: ${event.executor.match(/\((\d+)\)/)?.[1] || 'Unknown'}`,
-        iconURL: guild.iconURL()
-      });
-
-    if (event.reason) {
-      embed.addFields({
-        name: "Reason",
-        value: event.reason.length > 1024 ? event.reason.substring(0, 1021) + '...' : event.reason,
-        inline: false
-      });
-    }
-
-    if (event.duration) {
-      embed.addFields({
-        name: "Duration",
-        value: event.duration,
-        inline: true
-      });
-    }
-
-    if (event.metadata) {
-      Object.entries(event.metadata).forEach(([key, value]) => {
-        if (value !== undefined && value !== null) {
-          embed.addFields({
-            name: key.charAt(0).toUpperCase() + key.slice(1),
-            value: String(value).length > 1024 ? String(value).substring(0, 1021) + '...' : String(value),
-            inline: true
-          });
-        }
-      });
-    }
-
-    if (event.caseId) {
-      embed.addFields({
-        name: "Case ID",
-        value: `#${event.caseId}`,
-        inline: true
-      });
-    }
-
-    await logChannel.send({ embeds: [embed] });
-    
-    logger.info(`Moderation action logged: ${event.action} by ${event.executor} on ${event.target} in guild ${guild.id}`);
-    
-  } catch (error) {
-    logger.error("Error logging moderation event:", error);
-  }
-}
-
-export async function generateCaseId(client, guildId) {
-  try {
-    const caseKey = `moderation_cases_${guildId}`;
-    const currentCase = await getFromDb(caseKey, 0);
-    const nextCase = currentCase + 1;
-    await setInDb(caseKey, nextCase);
-    return nextCase;
-  } catch (error) {
-    logger.error("Error generating case ID:", error);
-    return Date.now();
-  }
-}
-
-/**
- * Store moderation case in database for audit trail
- * @param {Object} options - The case options
- * @param {string} options.guildId - The guild ID
- * @param {number} options.caseId - The case ID
- * @param {Object} options.caseData - The case data
- * @returns {Promise<boolean>} Success status
- */
-export async function storeModerationCase({ guildId, caseId, caseData }) {
-  try {
-    const caseKey = `moderation_case_${guildId}_${caseId}`;
-    const caseDataWithTimestamp = {
-      ...caseData,
-      createdAt: new Date().toISOString(),
-      caseId
-    };
-    
-    await setInDb(caseKey, caseDataWithTimestamp);
-    
-    const caseListKey = `moderation_cases_list_${guildId}`;
-    const caseList = await getFromDb(caseListKey, []);
-    caseList.push(caseDataWithTimestamp);
-    
-    if (caseList.length > 1000) {
-      caseList.splice(0, caseList.length - 1000);
-    }
-    
-    await setInDb(caseListKey, caseList);
-    return true;
-  } catch (error) {
-    logger.error("Error storing moderation case:", error);
-    return false;
-  }
-}
-
-/**
- * Get filtered moderation cases
- * @param {string} guildId - The guild ID
- * @param {Object} filters - Search filters
- * @returns {Promise<Array>} Filtered cases
- */
-export async function getModerationCases(guildId, filters = {}) {
-  try {
-    const { userId, moderatorId, action, limit = 50, offset = 0 } = filters;
-    
-    const caseListKey = `moderation_cases_list_${guildId}`;
-    const caseList = await getFromDb(caseListKey, []);
-    
-    let filteredCases = caseList;
-    
-    // TỐI ƯU HÓA: Tìm kiếm thông minh qua cả ID trực tiếp lẫn quét chuỗi text hiển thị 'target'
-    if (userId) {
-      filteredCases = filteredCases.filter(case_ => {
-        return case_.targetUserId === userId || (case_.target && case_.target.includes(userId));
-      });
-    }
-    
-    if (moderatorId) {
-      filteredCases = filteredCases.filter(case_ => {
-        return case_.moderatorId === moderatorId || (case_.executor && case_.executor.includes(moderatorId));
-      });
-    }
-    
-    if (action) {
-      filteredCases = filteredCases.filter(case_ => case_.action === action);
-    }
-    
-    filteredCases.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    
-    return filteredCases.slice(offset, offset + limit);
-  } catch (error) {
-    logger.error("Error getting moderation cases:", error);
-    return [];
-  }
-}
-
-/**
- * Enhanced logging function that stores case in database
- * @param {Object} options - The log options
- * @returns {Promise<number>} The generated case ID
- */
-export async function logModerationAction({ client, guild, event }) {
-  const caseId = await generateCaseId(client, guild.id);
-  
-  await storeModerationCase({
-    guildId: guild.id,
-    caseId,
-    caseData: {
-      action: event.action,
-      target: event.target,
-      executor: event.executor,
-      reason: event.reason,
-      duration: event.duration,
-      metadata: event.metadata,
-      targetUserId: event.metadata?.userId,
-      moderatorId: event.metadata?.moderatorId
-    }
-  });
-  
-  await logEvent({
-    client,
-    guild,
-    event: {
-      ...event,
-      caseId
-    }
-  });
-  
-  return caseId;
-}
 
 
 
@@ -5740,1320 +8625,6 @@ export default {
   checkBotPermissions,
   auditPermissionCheck
 };
-
-
-
-
-##### FILE: src\utils\postgresDatabase.js
-import pg from 'pg';
-import { pgConfig } from '../config/postgres.js';
-import { logger } from './logger.js';
-import { assertAllowlistedIdentifier, quoteIdentifier } from './sqlIdentifiers.js';
-
-class PostgreSQLDatabase {
-    constructor() {
-        this.pool = null;
-        this.isConnected = false;
-        this.connectionPromise = null;
-        this.allowedTableIdentifiers = new Set(Object.values(pgConfig.tables));
-        this.allowedMigrationIdentifiers = new Set([pgConfig.migration.table]);
-        this.lastFailureReason = null;
-        this.lastFailureMessage = null;
-    }
-
-    
-
-
-
-    async connect() {
-        if (this.connectionPromise) {
-            return this.connectionPromise;
-        }
-
-        this.connectionPromise = this._establishConnection();
-        return this.connectionPromise;
-    }
-
-    async _establishConnection() {
-        const retries = Number.isFinite(pgConfig.options.retries) ? pgConfig.options.retries : 0;
-        const baseDelay = Number.isFinite(pgConfig.options.backoffBase) ? pgConfig.options.backoffBase : 100;
-        const multiplier = Number.isFinite(pgConfig.options.backoffMultiplier) ? pgConfig.options.backoffMultiplier : 2;
-        const attempts = Math.max(1, retries + 1);
-
-        for (let attempt = 1; attempt <= attempts; attempt += 1) {
-            try {
-                await new Promise(resolve => setTimeout(resolve, 100));
-
-                this.pool = new pg.Pool({
-                    connectionString: pgConfig.url,
-                    
-                    host: pgConfig.options.host,
-                    port: pgConfig.options.port,
-                    database: pgConfig.options.database,
-                    user: pgConfig.options.user,
-                    password: pgConfig.options.password,
-                    ssl: pgConfig.options.ssl,
-                    
-                    
-                    max: pgConfig.options.max,
-                    min: pgConfig.options.min,
-                    idleTimeoutMillis: pgConfig.options.idleTimeoutMillis,
-                    connectionTimeoutMillis: pgConfig.options.connectionTimeoutMillis,
-                    
-                    
-                    application_name: pgConfig.options.application_name,
-                    statement_timeout: pgConfig.options.statement_timeout,
-                    keepalives: pgConfig.options.keepalives,
-                    keepalives_idle: pgConfig.options.keepalives_idle,
-                });
-
-                const client = await this.pool.connect();
-                await client.query('SELECT NOW()');
-                client.release();
-
-                this.lastFailureReason = null;
-                this.lastFailureMessage = null;
-
-                this.isConnected = true;
-                logger.info('✅ PostgreSQL Database initialized successfully');
-
-                if (pgConfig.features.autoCreateTables) {
-                    await this.createTables();
-
-                    try {
-                        const columnCheck = await this.pool.query(`
-                            SELECT column_name 
-                            FROM information_schema.columns 
-                            WHERE table_name = 'guilds' AND column_name = 'counters'
-                        `);
-
-                        if (columnCheck.rows.length === 0) {
-                            await this.pool.query(`
-                                ALTER TABLE ${pgConfig.tables.guilds} 
-                                ADD COLUMN counters JSONB DEFAULT '[]'
-                            `);
-                            logger.info('✅ Added counters column to guilds table');
-                        }
-                    } catch (error) {
-                        logger.warn('Could not add counters column to guilds table:', error.message);
-                    }
-                }
-
-                if (pgConfig.migration.enabled) {
-                    const migrationCheck = await this.verifySchemaVersion();
-                    if (!migrationCheck.ok) {
-                        const shouldBootstrapSchema =
-                            migrationCheck.reason === 'MISSING_MIGRATION_VERSION'
-                            && pgConfig.features.autoMigrate;
-
-                        if (shouldBootstrapSchema) {
-                            await this.setSchemaVersion(
-                                pgConfig.migration.expectedVersion,
-                                pgConfig.migration.expectedLabel
-                            );
-                            logger.warn(
-                                `No schema version found. Bootstrapped schema ledger to version ${pgConfig.migration.expectedVersion} (${pgConfig.migration.expectedLabel}).`
-                            );
-                            return true;
-                        }
-
-                        const error = new Error(
-                            `Schema version check failed: expected ${migrationCheck.expectedVersion} but found ${migrationCheck.currentVersion === null ? 'none' : migrationCheck.currentVersion}`
-                        );
-                        error.code = 'SCHEMA_VERSION_MISMATCH';
-                        throw error;
-                    }
-                }
-
-                return true;
-            } catch (error) {
-                this.lastFailureReason = error.code || 'POSTGRES_CONNECTION_FAILED';
-                this.lastFailureMessage = error.message || 'Unknown PostgreSQL error';
-
-                if (this.pool) {
-                    try {
-                        await this.pool.end();
-                    } catch (closeError) {
-                        logger.warn('Failed to close PostgreSQL pool after error:', closeError.message);
-                    }
-                    this.pool = null;
-                }
-
-                const isLastAttempt = attempt >= attempts;
-                const isSchemaMismatch = error.code === 'SCHEMA_VERSION_MISMATCH';
-                if (isLastAttempt) {
-                    logger.error('❌ Failed to initialize PostgreSQL Database:', error);
-                    this.isConnected = false;
-                    return false;
-                }
-
-                if (isSchemaMismatch) {
-                    logger.error('❌ Failed to initialize PostgreSQL Database:', error);
-                    this.isConnected = false;
-                    return false;
-                }
-
-                logger.warn(`PostgreSQL connection attempt ${attempt} failed: ${error.message}`);
-                const backoff = Math.round(baseDelay * Math.pow(multiplier, attempt - 1));
-                await new Promise(resolve => setTimeout(resolve, backoff));
-            }
-        }
-
-        this.isConnected = false;
-        return false;
-    }
-
-    
-
-
-
-    isAvailable() {
-        return this.isConnected && this.pool;
-    }
-
-    getLastFailure() {
-        return {
-            reason: this.lastFailureReason,
-            message: this.lastFailureMessage
-        };
-    }
-
-    async ensureMigrationLedger() {
-        const migrationTable = assertAllowlistedIdentifier(
-            pgConfig.migration.table,
-            this.allowedMigrationIdentifiers,
-            'PostgreSQL migration table identifier'
-        );
-        const safeMigrationTable = quoteIdentifier(migrationTable);
-
-        await this.pool.query(`
-            CREATE TABLE IF NOT EXISTS ${safeMigrationTable} (
-                version INTEGER PRIMARY KEY,
-                label VARCHAR(255) NOT NULL,
-                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
-        return safeMigrationTable;
-    }
-
-    async getLatestSchemaVersion() {
-        const safeMigrationTable = await this.ensureMigrationLedger();
-        const result = await this.pool.query(
-            `SELECT version, label, applied_at FROM ${safeMigrationTable} ORDER BY version DESC LIMIT 1`
-        );
-
-        if (result.rows.length === 0) {
-            return null;
-        }
-
-        return result.rows[0];
-    }
-
-    async setSchemaVersion(version, label) {
-        const safeMigrationTable = await this.ensureMigrationLedger();
-        await this.pool.query(
-            `INSERT INTO ${safeMigrationTable} (version, label)
-             VALUES ($1, $2)
-             ON CONFLICT (version)
-             DO UPDATE SET label = EXCLUDED.label, applied_at = CURRENT_TIMESTAMP`,
-            [version, label]
-        );
-    }
-
-    async verifySchemaVersion() {
-        const latest = await this.getLatestSchemaVersion();
-        const expectedVersion = Number(pgConfig.migration.expectedVersion);
-
-        if (!latest) {
-            return {
-                ok: false,
-                expectedVersion,
-                currentVersion: null,
-                reason: 'MISSING_MIGRATION_VERSION'
-            };
-        }
-
-        const currentVersion = Number(latest.version);
-        const isValid = currentVersion === expectedVersion;
-
-        return {
-            ok: isValid,
-            expectedVersion,
-            currentVersion,
-            label: latest.label,
-            appliedAt: latest.applied_at,
-            reason: isValid ? 'OK' : 'SCHEMA_VERSION_MISMATCH'
-        };
-    }
-
-    /**
-     * Create database tables
-     */
-    async createTables() {
-        const tables = [
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.guilds} (
-                id VARCHAR(20) PRIMARY KEY,
-                config JSONB DEFAULT '{}',
-                counters JSONB DEFAULT '[]',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`,
-
-            `CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id VARCHAR(20) PRIMARY KEY,
-                is_enabled BOOLEAN DEFAULT TRUE,
-                limit_count INT DEFAULT 3,
-                time_window INT DEFAULT 10,
-                punishment_type VARCHAR(20) DEFAULT 'quarantine',
-                quarantine_role_id VARCHAR(20),
-                log_channel_id VARCHAR(20),
-                honeypot_channel_id VARCHAR(20) DEFAULT NULL
-            )`,
-
-            `CREATE TABLE IF NOT EXISTS whitelist (
-                id SERIAL PRIMARY KEY,
-                guild_id VARCHAR(20) NOT NULL,
-                user_id VARCHAR(20) NOT NULL,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT unique_guild_user UNIQUE (guild_id, user_id)
-            )`,
-
-            `CREATE INDEX IF NOT EXISTS idx_whitelist_guild_user ON whitelist(guild_id, user_id)`,
-
-
-            `CREATE TABLE IF NOT EXISTS punished_users (
-                id SERIAL PRIMARY KEY,
-                guild_id VARCHAR(20) NOT NULL,
-                user_id VARCHAR(20) NOT NULL,
-                old_roles JSONB NOT NULL,
-                punished_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT unique_guild_punished UNIQUE (guild_id, user_id)
-            )`,
-
-            `CREATE INDEX IF NOT EXISTS idx_punished_users_guild_id ON punished_users(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_punished_users_user_id ON punished_users(user_id)`,
-
-
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.users} (
-                id VARCHAR(20) PRIMARY KEY,
-                username VARCHAR(100),
-                discriminator VARCHAR(10),
-                avatar VARCHAR(100),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.guild_users} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.birthdays} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                month INTEGER NOT NULL,
-                day INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.giveaways} (
-                id SERIAL PRIMARY KEY,
-                guild_id VARCHAR(20),
-                message_id VARCHAR(20) NOT NULL,
-                data JSONB NOT NULL,
-                ends_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                UNIQUE(guild_id, message_id)
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.tickets} (
-                guild_id VARCHAR(20),
-                channel_id VARCHAR(20) PRIMARY KEY,
-                data JSONB NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.afk_status} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                reason TEXT,
-                status_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.welcome_configs} (
-                guild_id VARCHAR(20) PRIMARY KEY,
-                config JSONB NOT NULL DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.leveling_configs} (
-                guild_id VARCHAR(20) PRIMARY KEY,
-                config JSONB NOT NULL DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.user_levels} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                xp BIGINT DEFAULT 0,
-                level INTEGER DEFAULT 0,
-                total_xp BIGINT DEFAULT 0,
-                last_message TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                rank INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.economy} (
-                guild_id VARCHAR(20),
-                user_id VARCHAR(20),
-                balance BIGINT DEFAULT 0,
-                bank BIGINT DEFAULT 0,
-                data JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES ${pgConfig.tables.users}(id) ON DELETE CASCADE
-            )`,
-
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.verification_audit} (
-                id SERIAL PRIMARY KEY,
-                guild_id VARCHAR(20) NOT NULL,
-                user_id VARCHAR(20) NOT NULL,
-                action VARCHAR(50) NOT NULL,
-                source VARCHAR(50),
-                moderator_id VARCHAR(20),
-                metadata JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.invite_tracking} (
-                guild_id VARCHAR(20),
-                inviter_id VARCHAR(20),
-                invite_code VARCHAR(20),
-                uses INTEGER DEFAULT 0,
-                data JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, invite_code),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.application_roles} (
-                guild_id VARCHAR(20),
-                role_id VARCHAR(20),
-                data JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, role_id),
-                FOREIGN KEY (guild_id) REFERENCES ${pgConfig.tables.guilds}(id) ON DELETE CASCADE
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.temp_data} (
-                key VARCHAR(255) PRIMARY KEY,
-                value JSONB NOT NULL,
-                expires_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`,
-            
-            `CREATE TABLE IF NOT EXISTS ${pgConfig.tables.cache_data} (
-                key VARCHAR(255) PRIMARY KEY,
-                value JSONB NOT NULL,
-                expires_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`
-        ];
-
-        for (const table of tables) {
-            try {
-                await this.pool.query(table);
-            } catch (error) {
-                logger.error('Error creating table:', error);
-            }
-        }
-        
-        logger.info('✅ Database tables created/verified');
-        
-        await this.createIndexes();
-        await this.createAuditTriggers();
-    }
-
-    
-
-
-    async createIndexes() {
-        const indexes = [
-            `CREATE INDEX IF NOT EXISTS idx_guild_users_guild_id ON ${pgConfig.tables.guild_users}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_guild_users_user_id ON ${pgConfig.tables.guild_users}(user_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_birthdays_guild_id ON ${pgConfig.tables.birthdays}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_birthdays_month_day ON ${pgConfig.tables.birthdays}(month, day)`,
-            `CREATE INDEX IF NOT EXISTS idx_giveaways_guild_id ON ${pgConfig.tables.giveaways}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_giveaways_ends_at ON ${pgConfig.tables.giveaways}(ends_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_tickets_guild_id ON ${pgConfig.tables.tickets}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_tickets_expires_at ON ${pgConfig.tables.tickets}(expires_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_afk_status_guild_id ON ${pgConfig.tables.afk_status}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_afk_status_expires_at ON ${pgConfig.tables.afk_status}(expires_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_user_levels_guild_id ON ${pgConfig.tables.user_levels}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_user_levels_xp ON ${pgConfig.tables.user_levels}(xp)`,
-            `CREATE INDEX IF NOT EXISTS idx_economy_guild_id ON ${pgConfig.tables.economy}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_verification_audit_guild_id ON ${pgConfig.tables.verification_audit}(guild_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_verification_audit_user_id ON ${pgConfig.tables.verification_audit}(user_id)`,
-            `CREATE INDEX IF NOT EXISTS idx_verification_audit_created_at ON ${pgConfig.tables.verification_audit}(created_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_temp_data_expires_at ON ${pgConfig.tables.temp_data}(expires_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_cache_data_expires_at ON ${pgConfig.tables.cache_data}(expires_at)`,
-            `CREATE INDEX IF NOT EXISTS idx_guild_settings_honeypot ON guild_settings(honeypot_channel_id)`
-        ];
-
-        for (const index of indexes) {
-            try {
-                await this.pool.query(index);
-            } catch (error) {
-                logger.warn('Error creating index:', error.message);
-            }
-        }
-        
-        logger.info('✅ Performance indexes created/verified');
-    }
-
-    
-
-
-    async createAuditTriggers() {
-        try {
-            const functionQuery = `
-                CREATE OR REPLACE FUNCTION update_updated_at_column()
-                RETURNS TRIGGER AS $$
-                BEGIN
-                    NEW.updated_at = CURRENT_TIMESTAMP;
-                    RETURN NEW;
-                END;
-                $$ language 'plpgsql';
-            `;
-            
-            await this.pool.query(functionQuery);
-            
-            const triggers = [
-                { name: 'update_guilds_updated_at', table: pgConfig.tables.guilds },
-                { name: 'update_users_updated_at', table: pgConfig.tables.users },
-                { name: 'update_welcome_configs_updated_at', table: pgConfig.tables.welcome_configs },
-                { name: 'update_leveling_configs_updated_at', table: pgConfig.tables.leveling_configs },
-                { name: 'update_user_levels_updated_at', table: pgConfig.tables.user_levels },
-                { name: 'update_economy_updated_at', table: pgConfig.tables.economy },
-                { name: 'update_application_roles_updated_at', table: pgConfig.tables.application_roles },
-                { name: 'update_invite_tracking_updated_at', table: pgConfig.tables.invite_tracking },
-                { name: 'update_guild_users_updated_at', table: pgConfig.tables.guild_users },
-                { name: 'update_birthdays_updated_at', table: pgConfig.tables.birthdays },
-                { name: 'update_giveaways_updated_at', table: pgConfig.tables.giveaways },
-                { name: 'update_tickets_updated_at', table: pgConfig.tables.tickets },
-                { name: 'update_afk_status_updated_at', table: pgConfig.tables.afk_status },
-            ];
-
-            const allowedTriggerIdentifiers = new Set(triggers.map(trigger => trigger.name));
-
-            for (const trigger of triggers) {
-                try {
-                    const safeTriggerIdentifier = assertAllowlistedIdentifier(
-                        trigger.name,
-                        allowedTriggerIdentifiers,
-                        'Trigger identifier'
-                    );
-                    const safeTableIdentifier = assertAllowlistedIdentifier(
-                        trigger.table,
-                        this.allowedTableIdentifiers,
-                        'Trigger table identifier'
-                    );
-
-                    await this.pool.query(
-                        `DROP TRIGGER IF EXISTS ${quoteIdentifier(safeTriggerIdentifier)} ON ${quoteIdentifier(safeTableIdentifier)};`
-                    );
-                    await this.pool.query(
-                        `CREATE TRIGGER ${quoteIdentifier(safeTriggerIdentifier)}
-                         BEFORE UPDATE ON ${quoteIdentifier(safeTableIdentifier)}
-                         FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();`
-                    );
-                } catch (error) {
-                    logger.warn(`Error creating trigger ${trigger.name} on ${trigger.table}: ${error.message}`);
-                }
-            }
-            
-            logger.info('✅ Audit triggers created/verified');
-        } catch (error) {
-            logger.warn('Error creating audit triggers:', error.message);
-        }
-    }
-
-    
-
-
-
-
-
-    async get(key, defaultValue = null) {
-        try {
-            if (!this.isAvailable()) {
-                logger.warn('PostgreSQL not available, returning default value');
-                return defaultValue;
-            }
-
-            const parsedKey = this.parseKey(key);
-            
-            if (parsedKey.type === 'temp') {
-                const result = await this.pool.query(
-                    `SELECT value FROM ${pgConfig.tables.temp_data} WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-                    [parsedKey.fullKey]
-                );
-                return result.rows.length > 0 ? result.rows[0].value : defaultValue;
-            }
-            
-            if (parsedKey.type === 'cache') {
-                const result = await this.pool.query(
-                    `SELECT value FROM ${pgConfig.tables.cache_data} WHERE key = $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-                    [parsedKey.fullKey]
-                );
-                return result.rows.length > 0 ? result.rows[0].value : defaultValue;
-            }
-
-            return await this.getStructuredData(parsedKey, defaultValue);
-        } catch (error) {
-            logger.error(`Error getting value for key ${key}:`, error);
-            return defaultValue;
-        }
-    }
-
-    
-
-
-
-
-
-
-    async set(key, value, ttl = null) {
-        try {
-            if (!this.isAvailable()) {
-                logger.warn('PostgreSQL not available, cannot set value');
-                return false;
-            }
-
-            const parsedKey = this.parseKey(key);
-            const expiresAt = ttl ? new Date(Date.now() + ttl * 1000) : null;
-            const jsonValue = JSON.stringify(value ?? null);
-            
-            if (parsedKey.type === 'temp') {
-                await this.pool.query(
-                    `INSERT INTO ${pgConfig.tables.temp_data} (key, value, expires_at) 
-                     VALUES ($1, $2, $3) 
-                     ON CONFLICT (key) DO UPDATE SET value = $2, expires_at = $3`,
-                    [parsedKey.fullKey, jsonValue, expiresAt]
-                );
-                return true;
-            }
-            
-            if (parsedKey.type === 'cache') {
-                await this.pool.query(
-                    `INSERT INTO ${pgConfig.tables.cache_data} (key, value, expires_at) 
-                     VALUES ($1, $2, $3) 
-                     ON CONFLICT (key) DO UPDATE SET value = $2, expires_at = $3`,
-                    [parsedKey.fullKey, jsonValue, expiresAt]
-                );
-                return true;
-            }
-
-            return await this.setStructuredData(parsedKey, value, ttl);
-        } catch (error) {
-            logger.error(`Error setting value for key ${key}:`, error);
-            return false;
-        }
-    }
-
-    
-
-
-
-
-    async delete(key) {
-        try {
-            if (!this.isAvailable()) {
-                logger.warn('PostgreSQL not available, cannot delete key');
-                return false;
-            }
-
-            const parsedKey = this.parseKey(key);
-            
-            if (parsedKey.type === 'temp') {
-                await this.pool.query(`DELETE FROM ${pgConfig.tables.temp_data} WHERE key = $1`, [parsedKey.fullKey]);
-                return true;
-            }
-            
-            if (parsedKey.type === 'cache') {
-                await this.pool.query(`DELETE FROM ${pgConfig.tables.cache_data} WHERE key = $1`, [parsedKey.fullKey]);
-                return true;
-            }
-
-            return await this.deleteStructuredData(parsedKey);
-        } catch (error) {
-            logger.error(`Error deleting key ${key}:`, error);
-            return false;
-        }
-    }
-
-    
-
-
-
-
-    async list(prefix) {
-        try {
-            if (!this.isAvailable()) {
-                logger.warn('PostgreSQL not available, returning empty list');
-                return [];
-            }
-
-            const keys = [];
-            
-            const tempResult = await this.pool.query(
-                `SELECT key FROM ${pgConfig.tables.temp_data} WHERE key LIKE $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-                [`${prefix}%`]
-            );
-            keys.push(...tempResult.rows.map(row => row.key));
-            
-            const cacheResult = await this.pool.query(
-                `SELECT key FROM ${pgConfig.tables.cache_data} WHERE key LIKE $1 AND (expires_at IS NULL OR expires_at > NOW())`,
-                [`${prefix}%`]
-            );
-            keys.push(...cacheResult.rows.map(row => row.key));
-
-            return keys;
-        } catch (error) {
-            logger.error(`Error listing keys with prefix ${prefix}:`, error);
-            return [];
-        }
-    }
-
-    
-
-
-
-
-    async insertVerificationAudit(record) {
-        try {
-            if (!this.isAvailable()) {
-                return false;
-            }
-
-            const {
-                guildId,
-                userId,
-                action,
-                source = null,
-                moderatorId = null,
-                metadata = {},
-                createdAt = new Date()
-            } = record;
-
-            const timestamp = createdAt instanceof Date ? createdAt : new Date(createdAt);
-
-            await this.pool.query(
-                `INSERT INTO ${pgConfig.tables.verification_audit} (guild_id, user_id, action, source, moderator_id, metadata, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                [guildId, userId, action, source, moderatorId, metadata, timestamp]
-            );
-
-            return true;
-        } catch (error) {
-            logger.error('Error inserting verification audit:', error);
-            return false;
-        }
-    }
-
-    
-
-
-
-
-    async exists(key) {
-        try {
-            if (!this.isAvailable()) {
-                return false;
-            }
-
-            const value = await this.get(key);
-            return value !== null;
-        } catch (error) {
-            logger.error(`Error checking if key exists ${key}:`, error);
-            return false;
-        }
-    }
-
-    
-
-
-
-
-
-    async increment(key, amount = 1) {
-        try {
-            if (!this.isAvailable()) {
-                return amount;
-            }
-
-            const currentValue = await this.get(key, 0);
-            const newValue = (typeof currentValue === 'number' ? currentValue : 0) + amount;
-            await this.set(key, newValue);
-            return newValue;
-        } catch (error) {
-            logger.error(`Error incrementing key ${key}:`, error);
-            return amount;
-        }
-    }
-
-    
-
-
-
-
-
-    async decrement(key, amount = 1) {
-        try {
-            if (!this.isAvailable()) {
-                return -amount;
-            }
-
-            const currentValue = await this.get(key, 0);
-            const newValue = (typeof currentValue === 'number' ? currentValue : 0) - amount;
-            await this.set(key, newValue);
-            return newValue;
-        } catch (error) {
-            logger.error(`Error decrementing key ${key}:`, error);
-            return -amount;
-        }
-    }
-
-    parseKey(key) {
-        
-        if (key.startsWith('temp:')) {
-            return { type: 'temp', fullKey: key };
-        }
-        if (key.startsWith('cache:')) {
-            return { type: 'cache', fullKey: key };
-        }
-
-        const parts = key.split(':');
-        
-        
-        if (parts[0] === 'guild') {
-            if (parts[2] === 'config') {
-                return { type: 'guild_config', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'birthdays') {
-                return { type: 'guild_birthdays', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'giveaways') {
-                return { type: 'guild_giveaways', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'welcome') {
-                return { type: 'welcome_config', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'leveling') {
-                
-                if (parts[3] === 'config') {
-                    return { type: 'leveling_config', guildId: parts[1], fullKey: key };
-                }
-                if (parts[3] === 'users') {
-                    return { type: 'user_level', guildId: parts[1], userId: parts[4], fullKey: key };
-                }
-                return { type: 'leveling_data', guildId: parts[1], fullKey: key };
-            }
-            if (parts[2] === 'economy' && parts[3]) {
-                return { type: 'economy', guildId: parts[1], userId: parts[3], fullKey: key };
-            }
-            if (parts[2] === 'afk' && parts[3]) {
-                return { type: 'afk_status', guildId: parts[1], userId: parts[3], fullKey: key };
-            }
-            if (parts[2] === 'ticket' && parts[3]) {
-                return { type: 'ticket', guildId: parts[1], channelId: parts[3], fullKey: key };
-            }
-        }
-
-        
-        if (parts[0] === 'counters' && parts[1]) {
-            return { type: 'counters', guildId: parts[1], fullKey: key };
-        }
-
-        
-        return { type: 'temp', fullKey: key };
-    }
-
-    /**
-     * Get structured data from appropriate table
-     * @param {Object} parsedKey - Parsed key information
-     * @param {any} defaultValue - Default value
-     * @returns {Promise<any>} The data
-     */
-    async getStructuredData(parsedKey, defaultValue) {
-        try {
-            switch (parsedKey.type) {
-                case 'guild_config':
-                    const guildResult = await this.pool.query(
-                        `SELECT config FROM ${pgConfig.tables.guilds} WHERE id = $1`,
-                        [parsedKey.guildId]
-                    );
-                    return guildResult.rows.length > 0 ? guildResult.rows[0].config : defaultValue;
-                
-                case 'guild_birthdays':
-                    const birthdayResult = await this.pool.query(
-                        `SELECT user_id, month, day FROM ${pgConfig.tables.birthdays} WHERE guild_id = $1`,
-                        [parsedKey.guildId]
-                    );
-                    const birthdays = {};
-                    birthdayResult.rows.forEach(row => {
-                        birthdays[row.user_id] = { month: row.month, day: row.day };
-                    });
-                    return birthdays;
-                
-                case 'guild_giveaways':
-                    const giveawayResult = await this.pool.query(
-                        `SELECT data FROM ${pgConfig.tables.giveaways} WHERE guild_id = $1`,
-                        [parsedKey.guildId]
-                    );
-                    return giveawayResult.rows.map(row => row.data);
-                
-                case 'welcome_config':
-                    const welcomeResult = await this.pool.query(
-                        `SELECT config FROM ${pgConfig.tables.welcome_configs} WHERE guild_id = $1`,
-                        [parsedKey.guildId]
-                    );
-                    return welcomeResult.rows.length > 0 ? welcomeResult.rows[0].config : defaultValue;
-                
-                case 'leveling_config':
-                    const levelingConfigResult = await this.pool.query(
-                        `SELECT config FROM ${pgConfig.tables.leveling_configs} WHERE guild_id = $1`,
-                        [parsedKey.guildId]
-                    );
-                    return levelingConfigResult.rows.length > 0 ? levelingConfigResult.rows[0].config : defaultValue;
-                
-                case 'user_level':
-                    const userLevelResult = await this.pool.query(
-                        `SELECT xp, level, total_xp, last_message, rank FROM ${pgConfig.tables.user_levels} WHERE guild_id = $1 AND user_id = $2`,
-                        [parsedKey.guildId, parsedKey.userId]
-                    );
-                    return userLevelResult.rows.length > 0 ? userLevelResult.rows[0] : defaultValue;
-                
-                case 'economy': {
-                    const economyResult = await this.pool.query(
-                        `SELECT balance, bank, data FROM ${pgConfig.tables.economy} WHERE guild_id = $1 AND user_id = $2`,
-                        [parsedKey.guildId, parsedKey.userId]
-                    );
-                    if (economyResult.rows.length === 0) return defaultValue;
-                    const row = economyResult.rows[0];
-                    // Return the full data blob when available (contains wallet, bank, etc.)
-                    // Fall back to constructing a compatible object from the columns
-                    if (row.data && typeof row.data === 'object' && Object.keys(row.data).length > 0) {
-                        return row.data;
-                    }
-                    return { wallet: row.balance ?? 0, bank: row.bank ?? 0 };
-                }
-                
-                case 'afk_status':
-                    const afkResult = await this.pool.query(
-                        `SELECT reason, status_at, expires_at FROM ${pgConfig.tables.afk_status} WHERE guild_id = $1 AND user_id = $2`,
-                        [parsedKey.guildId, parsedKey.userId]
-                    );
-                    return afkResult.rows.length > 0 ? afkResult.rows[0] : defaultValue;
-                
-                case 'ticket':
-                    const ticketResult = await this.pool.query(
-                        `SELECT data FROM ${pgConfig.tables.tickets} WHERE guild_id = $1 AND channel_id = $2`,
-                        [parsedKey.guildId, parsedKey.channelId]
-                    );
-                    return ticketResult.rows.length > 0 ? ticketResult.rows[0].data : defaultValue;
-                
-                case 'counters':
-                    const counterResult = await this.pool.query(
-                        `SELECT counters FROM ${pgConfig.tables.guilds} WHERE id = $1`,
-                        [parsedKey.guildId]
-                    );
-                    return counterResult.rows.length > 0 ? counterResult.rows[0].counters : defaultValue;
-                
-                default:
-                    return defaultValue;
-            }
-        } catch (error) {
-            logger.error(`Error getting structured data for ${parsedKey.fullKey}:`, error);
-            return defaultValue;
-        }
-    }
-
-    /**
-     * Set structured data to appropriate table
-     * @param {Object} parsedKey - Parsed key information
-     * @param {any} value - Value to set
-     * @param {number} ttl - Optional TTL
-     * @returns {Promise<boolean>} Success status
-     */
-    async setStructuredData(parsedKey, value, ttl) {
-        try {
-            switch (parsedKey.type) {
-                case 'guild_config':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, config, updated_at) 
-                         VALUES ($1, $2, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO UPDATE SET config = $2, updated_at = CURRENT_TIMESTAMP`,
-                        [parsedKey.guildId, value]
-                    );
-                    return true;
-                
-                case 'guild_birthdays':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.guildId]
-                    );
-                    
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.birthdays} WHERE guild_id = $1`, [parsedKey.guildId]);
-                    
-                    for (const [userId, birthday] of Object.entries(value)) {
-                        await this.pool.query(
-                            `INSERT INTO ${pgConfig.tables.users} (id, created_at) 
-                             VALUES ($1, CURRENT_TIMESTAMP) 
-                             ON CONFLICT (id) DO NOTHING`,
-                            [userId]
-                        );
-                        
-                        await this.pool.query(
-                            `INSERT INTO ${pgConfig.tables.birthdays} (guild_id, user_id, month, day) 
-                             VALUES ($1, $2, $3, $4)`,
-                            [parsedKey.guildId, userId, birthday.month, birthday.day]
-                        );
-                    }
-                    return true;
-                
-                case 'guild_giveaways':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.guildId]
-                    );
-                    
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.giveaways} WHERE guild_id = $1`, [parsedKey.guildId]);
-
-                    const giveaways = Array.isArray(value)
-                        ? value
-                        : (value && typeof value === 'object' ? Object.values(value) : []);
-
-                    for (const giveaway of giveaways) {
-                        if (!giveaway?.messageId) {
-                            continue;
-                        }
-                        await this.pool.query(
-                            `INSERT INTO ${pgConfig.tables.giveaways} (guild_id, message_id, data, ends_at) 
-                             VALUES ($1, $2, $3, $4)`,
-                            [parsedKey.guildId, giveaway.messageId, giveaway, giveaway.endsAt ? new Date(giveaway.endsAt) : null]
-                        );
-                    }
-                    return true;
-                
-                case 'welcome_config':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.guildId]
-                    );
-                    
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.welcome_configs} (guild_id, config, updated_at) 
-                         VALUES ($1, $2, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (guild_id) DO UPDATE SET config = $2, updated_at = CURRENT_TIMESTAMP`,
-                        [parsedKey.guildId, value]
-                    );
-                    return true;
-                
-                case 'leveling_config':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.guildId]
-                    );
-                    
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.leveling_configs} (guild_id, config, updated_at) 
-                         VALUES ($1, $2, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (guild_id) DO UPDATE SET config = $2, updated_at = CURRENT_TIMESTAMP`,
-                        [parsedKey.guildId, value]
-                    );
-                    return true;
-                
-                case 'user_level':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.guildId]
-                    );
-                    
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.users} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.userId]
-                    );
-                    
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.user_levels} (guild_id, user_id, xp, level, total_xp, last_message, rank, updated_at) 
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (guild_id, user_id) DO UPDATE SET 
-                         xp = $3, level = $4, total_xp = $5, last_message = $6, rank = $7, updated_at = CURRENT_TIMESTAMP`,
-                        [parsedKey.guildId, parsedKey.userId, value.xp || 0, value.level || 0, value.totalXp || 0, value.lastMessage || new Date(), value.rank || 0]
-                    );
-                    return true;
-                
-                case 'economy':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.guildId]
-                    );
-                    
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.users} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.userId]
-                    );
-                    
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.economy} (guild_id, user_id, balance, bank, data, updated_at) 
-                         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (guild_id, user_id) DO UPDATE SET 
-                         balance = $3, bank = $4, data = $5, updated_at = CURRENT_TIMESTAMP`,
-                        [parsedKey.guildId, parsedKey.userId, value.wallet ?? value.balance ?? 0, value.bank ?? 0, value]
-                    );
-                    return true;
-                
-                case 'afk_status':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.guildId]
-                    );
-                    
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.users} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.userId]
-                    );
-                    
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.afk_status} (guild_id, user_id, reason, expires_at) 
-                         VALUES ($1, $2, $3, $4) 
-                         ON CONFLICT (guild_id, user_id) DO UPDATE SET 
-                         reason = $3, expires_at = $4, status_at = CURRENT_TIMESTAMP`,
-                        [parsedKey.guildId, parsedKey.userId, value.reason, value.expiresAt ? new Date(value.expiresAt) : null]
-                    );
-                    return true;
-                
-                case 'ticket':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.guildId]
-                    );
-                    
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.tickets} (guild_id, channel_id, data, expires_at) 
-                         VALUES ($1, $2, $3, $4) 
-                         ON CONFLICT (channel_id) DO UPDATE SET 
-                         data = $3, expires_at = $4, updated_at = CURRENT_TIMESTAMP`,
-                        [parsedKey.guildId, parsedKey.channelId, value, ttl ? new Date(Date.now() + ttl * 1000) : null]
-                    );
-                    return true;
-                
-                case 'counters':
-                    await this.pool.query(
-                        `INSERT INTO ${pgConfig.tables.guilds} (id, created_at) 
-                         VALUES ($1, CURRENT_TIMESTAMP) 
-                         ON CONFLICT (id) DO NOTHING`,
-                        [parsedKey.guildId]
-                    );
-                    
-                    const columnCheck = await this.pool.query(`
-                        SELECT column_name 
-                        FROM information_schema.columns 
-                        WHERE table_name = '${pgConfig.tables.guilds}' AND column_name = 'counters'
-                    `);
-                    
-                    if (columnCheck.rows.length === 0) {
-                        logger.warn('Counters column does not exist, attempting to add it...');
-                        try {
-                            await this.pool.query(`
-                                ALTER TABLE ${pgConfig.tables.guilds} 
-                                ADD COLUMN counters JSONB DEFAULT '[]'
-                            `);
-                            logger.info('✅ Added counters column to guilds table');
-                        } catch (alterError) {
-                            logger.error('Failed to add counters column:', alterError);
-                            throw new Error(`Counters column missing and could not be created: ${alterError.message}`);
-                        }
-                    }
-                    
-                    logger.debug('Saving counter data to PostgreSQL', { type: typeof value, isArray: Array.isArray(value) });
-
-                    const normalizedCounters = Array.isArray(value) ? value : [];
-                    const jsonString = JSON.stringify(normalizedCounters);
-
-                    try {
-                        await this.pool.query(
-                            `INSERT INTO ${pgConfig.tables.guilds} (id, counters, updated_at) 
-                             VALUES ($1, $2::jsonb, CURRENT_TIMESTAMP) 
-                             ON CONFLICT (id) DO UPDATE SET counters = $2::jsonb, updated_at = CURRENT_TIMESTAMP`,
-                            [parsedKey.guildId, jsonString]
-                        );
-                    } catch (queryError) {
-                        logger.error('PostgreSQL query error', { message: queryError.message, detail: queryError.detail, hint: queryError.hint });
-                        throw queryError;
-                    }
-                    return true;
-                
-                default:
-                    return false;
-            }
-        } catch (error) {
-            logger.error(`Error setting structured data for ${parsedKey.fullKey}:`, error);
-            return false;
-        }
-    }
-
-    /**
-     * Delete structured data from appropriate table
-     * @param {Object} parsedKey - Parsed key information
-     * @returns {Promise<boolean>} Success status
-     */
-    async deleteStructuredData(parsedKey) {
-        try {
-            switch (parsedKey.type) {
-                case 'guild_config':
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.guilds} WHERE id = $1`, [parsedKey.guildId]);
-                    return true;
-                
-                case 'guild_birthdays':
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.birthdays} WHERE guild_id = $1`, [parsedKey.guildId]);
-                    return true;
-                
-                case 'guild_giveaways':
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.giveaways} WHERE guild_id = $1`, [parsedKey.guildId]);
-                    return true;
-                
-                case 'welcome_config':
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.welcome_configs} WHERE guild_id = $1`, [parsedKey.guildId]);
-                    return true;
-                
-                case 'leveling_config':
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.leveling_configs} WHERE guild_id = $1`, [parsedKey.guildId]);
-                    return true;
-                
-                case 'user_level':
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.user_levels} WHERE guild_id = $1 AND user_id = $2`, [parsedKey.guildId, parsedKey.userId]);
-                    return true;
-                
-                case 'economy':
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.economy} WHERE guild_id = $1 AND user_id = $2`, [parsedKey.guildId, parsedKey.userId]);
-                    return true;
-                
-                case 'afk_status':
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.afk_status} WHERE guild_id = $1 AND user_id = $2`, [parsedKey.guildId, parsedKey.userId]);
-                    return true;
-                
-                case 'ticket':
-                    await this.pool.query(`DELETE FROM ${pgConfig.tables.tickets} WHERE guild_id = $1 AND channel_id = $2`, [parsedKey.guildId, parsedKey.channelId]);
-                    return true;
-                
-                default:
-                    return false;
-            }
-        } catch (error) {
-            logger.error(`Error deleting structured data for ${parsedKey.fullKey}:`, error);
-            return false;
-        }
-    }
-
-    
-
-
-    async disconnect() {
-        try {
-            if (this.pool) {
-                await this.pool.end();
-                logger.info('PostgreSQL connection closed');
-            }
-        } catch (error) {
-            logger.error('Error closing PostgreSQL connection:', error);
-        }
-    }
-
-    
-
-
-
-    async getInfo() {
-        try {
-            if (!this.isAvailable()) {
-                return null;
-            }
-
-            const result = await this.pool.query('SELECT version()');
-            return {
-                version: result.rows[0].version,
-                connected: this.isConnected,
-                poolSize: this.pool.totalCount,
-                idleCount: this.pool.idleCount,
-                waitingCount: this.pool.waitingCount
-            };
-        } catch (error) {
-            logger.error('Error getting PostgreSQL info:', error);
-            return null;
-        }
-    }
-}
-
-const pgDb = new PostgreSQLDatabase();
-
-export { PostgreSQLDatabase, pgDb };
-
 
 
 

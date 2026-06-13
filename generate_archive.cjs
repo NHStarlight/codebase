@@ -9,7 +9,26 @@ const priorityFiles = [
   'src\\app.js',
   'src\\handlers\\commandLoader.js',
   'src\\services\\antinukeService.js',
-  'src\\utils\\database.js'
+  'src\\utils\\database.js',
+  'src\\utils\\postgresDatabase.js',
+  'src\\utils\\cacheManager.js',
+  'src\\utils\\memoryManager.js',
+  'src\\utils\\errorHandler.js',
+  'src\\utils\\moderation.js',
+  'src\\services\\moderationService.js',
+  'src\\handlers\\commands.js',
+  'src\\events\\interactionCreate.js',
+  'src\\events\\messageCreate.js',
+  'src\\handlers\\events.js',
+  'src\\services\\database.js',
+  'src\\services\\guildConfig.js',
+  'src\\services\\verificationService.js',
+  'src\\services\\ticket.js',
+  'src\\handlers\\ticketButtons.js',
+  'src\\services\\warningService.js',
+  'src\\services\\punishmentService.js',
+  'src\\services\\loggingService.js',
+  'src\\utils\\memoryStorage.js',
 ];
 
 // Get all .js files recursively
