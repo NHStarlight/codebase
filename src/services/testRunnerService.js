@@ -70,6 +70,36 @@ class TestRunner {
    * @returns {TestRunner}
    */
   static fromEnv() {
+    const PLACEHOLDER_PATTERNS = [
+      'YOUR_MAIN_BOT_TOKEN_HERE',
+      'YOUR_ALT_TOKEN',
+      'YOUR_TOKEN',
+      'your_main_bot_token',
+      'your_alt_token',
+      'your_token',
+      'token1',
+      'token2',
+      'token3',
+    ];
+
+    const isPlaceholder = (val) => {
+      if (!val) return true;
+      const lower = val.toLowerCase().trim();
+      return PLACEHOLDER_PATTERNS.some((p) => lower.includes(p.toLowerCase()));
+    };
+
+    const isDiscordToken = (val) => {
+      if (!val || typeof val !== 'string') return false;
+      // Discord tokens are typically 70+ chars with dots
+      return val.length >= 50 && val.includes('.');
+    };
+
+    const isSnowflake = (val) => {
+      if (!val || typeof val !== 'string') return false;
+      return /^\d{17,20}$/.test(val.trim());
+    };
+
+    // ── Read tokens ──
     const mainToken = process.env.BOT_MAIN_TOKEN || process.env.DISCORD_TOKEN || process.env.TOKEN;
     const altTokensRaw = process.env.BOT_ALT_TOKENS || '';
     const altTokens = altTokensRaw
@@ -84,16 +114,59 @@ class TestRunner {
       .map((c) => c.trim())
       .filter(Boolean);
 
-    // Validation
-    if (!mainToken) {
-      logger.warn('[TestRunner] BOT_MAIN_TOKEN (or DISCORD_TOKEN/TOKEN) is missing or empty. Main client will not connect.');
+    // ── Validation ──
+    const errors = [];
+    const warnings = [];
+
+    // Main token
+    if (!mainToken || isPlaceholder(mainToken)) {
+      errors.push('BOT_MAIN_TOKEN is missing or still a placeholder. Set a real Discord bot token in .env');
+    } else if (!isDiscordToken(mainToken)) {
+      errors.push(`BOT_MAIN_TOKEN looks invalid (expected Discord token format, got ${mainToken.length} chars). Check your .env`);
     }
+
+    // Alt tokens
     if (altTokens.length === 0) {
-      logger.warn('[TestRunner] BOT_ALT_TOKENS is missing or empty. No alt accounts will be available.');
+      warnings.push('BOT_ALT_TOKENS is empty. No alt accounts will be available for multi-client testing.');
+    } else {
+      for (let i = 0; i < altTokens.length; i++) {
+        const t = altTokens[i];
+        if (isPlaceholder(t)) {
+          errors.push(`BOT_ALT_TOKENS[${i}] is a placeholder ("${t}"). Replace with a real Discord token`);
+        } else if (!isDiscordToken(t)) {
+          errors.push(`BOT_ALT_TOKENS[${i}] looks invalid (expected Discord token format, got ${t.length} chars)`);
+        }
+      }
     }
-    if (!testGuildId) {
-      logger.warn('[TestRunner] TEST_GUILD_ID (or GUILD_ID) is missing. Some features may not work.');
+
+    // Guild ID
+    if (!testGuildId || isPlaceholder(testGuildId)) {
+      warnings.push('TEST_GUILD_ID is missing or placeholder. Some features may not work.');
+    } else if (!isSnowflake(testGuildId)) {
+      warnings.push(`TEST_GUILD_ID looks invalid (expected 17-20 digit snowflake, got "${testGuildId}")`);
     }
+
+    // Invite codes
+    if (inviteCodes.length === 0) {
+      warnings.push('TEST_INVITE_CODES is empty. Auto-rejoin will not work without invite codes.');
+    }
+
+    // ── Log results ──
+    for (const w of warnings) {
+      logger.warn(`[TestRunner] ${w}`);
+    }
+
+    if (errors.length > 0) {
+      for (const e of errors) {
+        logger.error(`[TestRunner] ${e}`);
+      }
+      logger.error(`[TestRunner] ${errors.length} validation error(s) found. TestRunner will be created but may not function correctly.`);
+    }
+
+    logger.info(
+      `[TestRunner] Config loaded: mainToken=${mainToken && !isPlaceholder(mainToken) ? '***' : 'MISSING'}, ` +
+      `altTokens=${altTokens.length}, guildId=${testGuildId || 'MISSING'}, inviteCodes=${inviteCodes.length}`
+    );
 
     const config = {
       mainToken: mainToken || '',
@@ -112,8 +185,6 @@ class TestRunner {
         batchSize: 5,
       },
     };
-
-    logger.info(`[TestRunner] Config loaded from env: mainToken=${mainToken ? '***' : 'MISSING'}, altTokens=${altTokens.length}, guildId=${testGuildId || 'MISSING'}`);
 
     return new TestRunner(config);
   }
