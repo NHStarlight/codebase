@@ -1,0 +1,8 @@
+{
+  "files.encoding": "utf8",
+  "files.autoGuessEncoding": false,
+  "githubPullRequests.ignoredPullRequestBranches": [
+    "main",
+    "main"
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "name": "starlight-security",
+  "version": "1.1.1",
+  "description": "Starlight Security - Advanced Discord Bot",
+  "main": "src/app.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/app.js",
+    "test": "node --test tests/**/*.test.js",
+    "migrate": "node scripts/migrate.js apply",
+    "migrate:check": "node scripts/migrate.js check",
+    "migrate:status": "node scripts/migrate.js status",
+    "backup:db": "node scripts/backup.js",
+    "restore:db": "node scripts/restore.js",
+    "backup:drill": "node scripts/restore-drill.js",
+    "live-test": "node scripts/live-test.js"
+  },
+  "dependencies": {
+    "@discordjs/rest": "^2.6.1",
+    "axios": "^1.15.2",
+    "discord.js": "^14.15.3",
+    "dotenv": "^17.4.2",
+    "express": "^5.1.0",
+    "node-cron": "^4.2.1",
+    "pg": "^8.21.0",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "zod": "^3.25.76"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
